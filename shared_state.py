@@ -24,9 +24,17 @@ def init_db():
                 qty REAL NOT NULL,
                 entry_price REAL NOT NULL,
                 total_cost REAL NOT NULL,
-                date TEXT NOT NULL
+                date TEXT NOT NULL,
+                stop_loss_pct REAL DEFAULT -3.0,
+                take_profit_pct REAL DEFAULT 5.0
             )
         """)
+        # Migration: Add columns if they don't exist
+        try:
+            conn.execute("ALTER TABLE holdings ADD COLUMN stop_loss_pct REAL DEFAULT -3.0")
+            conn.execute("ALTER TABLE holdings ADD COLUMN take_profit_pct REAL DEFAULT 5.0")
+        except sqlite3.OperationalError:
+            pass # Columns already exist
         conn.execute("""
             CREATE TABLE IF NOT EXISTS signals (
                 ticker TEXT PRIMARY KEY,
@@ -46,6 +54,22 @@ def init_db():
                 date TEXT NOT NULL
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS watchlist (
+                ticker TEXT PRIMARY KEY
+            )
+        """)
+        
+        # Seed default watchlist if empty
+        cursor = conn.execute("SELECT COUNT(*) FROM watchlist")
+        if cursor.fetchone()[0] == 0:
+            defaults = [
+                "AAPL", "MSFT", "NVDA", "TSLA",
+                "BTC-USD", "ETH-USD",
+                "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS",
+                "XOM", "CVX"
+            ]
+            conn.executemany("INSERT INTO watchlist (ticker) VALUES (?)", [(t,) for t in defaults])
         
         # Ensure portfolio row exists
         cursor = conn.execute("SELECT id FROM portfolio WHERE id=1")

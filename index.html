@@ -389,6 +389,7 @@
         
         <h3 style="margin-top: 30px;">Automation</h3>
         <button class="run-btn" style="background: #6366f1; border-left: 4px solid #a5b4fc;" onclick="showPortfolio()">🏦 PAPER TRADING PORTFOLIO</button>
+        <button class="run-btn" style="background: #475569; margin-top: 10px;" onclick="showWatchlist()">📋 MANAGE WATCHLIST</button>
     </div>
 
     <!-- MAIN DASHBOARD -->
@@ -431,6 +432,24 @@
             
             <h3 style="color: var(--text-dim); margin-top: 30px; letter-spacing: 2px;">TRADE HISTORY</h3>
             <div class="llm-terminal" id="port-history" style="height: 300px; overflow-y: auto;">
+                <!-- Filled dynamically -->
+            </div>
+        </div>
+        
+        <!-- WATCHLIST CONTAINER -->
+        <div id="watchlist-container" style="display: none;">
+            <div class="ticker-header">
+                <h1 class="ticker-title">WATCHLIST CONFIGURATION</h1>
+            </div>
+            
+            <p style="color: var(--text-dim); margin-top: 20px;">The AI Paper Trader will automatically scan these assets during a sweep.</p>
+            
+            <div style="display: flex; gap: 10px; margin-top: 15px;">
+                <input type="text" id="wl-add-input" placeholder="TICKER (e.g. AAPL)" style="flex: 1; padding: 10px; background: #000; border: 1px solid var(--border-dim); color: white; text-transform: uppercase;">
+                <button class="run-btn" style="width: 150px; background: #059669;" onclick="addToWatchlist()">ADD</button>
+            </div>
+            
+            <div id="wl-list" style="margin-top: 20px; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px;">
                 <!-- Filled dynamically -->
             </div>
         </div>
@@ -479,8 +498,10 @@
             </div>
 
             <div class="llm-terminal">
-                <div class="llm-header">> LLM STRATEGIC SYNTHESIS</div>
+                <div class="llm-header">> NEWS SENTIMENT ENGINE</div>
                 <div id="res-llm">Awaiting data execution...</div>
+                <div class="llm-header" style="margin-top: 15px;">> AI CONSENSUS SCORE BREAKDOWN</div>
+                <pre id="res-breakdown" style="color: #fff; font-size: 0.9em;"></pre>
             </div>
 
             <div id="backtest-results" style="display: none; background: #000; border: 1px solid var(--border-dim); border-left: 3px solid #059669; padding: 15px; margin-top: 15px; font-family: var(--font-mono);">
@@ -512,7 +533,7 @@
                 <h3>2. LIVE DATA AUTOMATION</h3>
                 <p>The system connects directly to Yahoo Finance (yfinance) on the backend. It bypasses old CSV files and fetches the literal up-to-the-minute live ticks for whatever asset you query.</p>
                 <h3>3. EXPLAINABLE AI (XAI)</h3>
-                <p>When the CNN detects a pattern, it doesn't just guess. It uses Grad-CAM heatmapping to calculate the exact coordinate bounds of the pattern (e.g., "Flag detected between Day 14 and Day 18"). This is passed to the LLM Advisor for translation.</p>
+                <p>When the CNN detects a pattern, it doesn't just guess. It uses Grad-CAM heatmapping to calculate the exact coordinate bounds of the pattern (e.g., "Flag detected between Day 14 and Day 18"). This is passed to the AI for translation.</p>
             </div>
         </div>
     </div>
@@ -657,8 +678,16 @@
                 document.getElementById('res-rl').innerText = data.execution_suggestion.rl_position_size;
                 document.getElementById('res-stop').innerText = "$" + data.execution_suggestion.stop_loss.usd.toLocaleString() + " / ₹" + data.execution_suggestion.stop_loss.inr.toLocaleString();
 
-                // LLM Text
-                document.getElementById('res-llm').innerText = data.llm_advisor_summary;
+                // LLM Text & Breakdown
+                document.getElementById('res-llm').innerText = data.ai_analysis.llm_advisor_summary;
+                
+                let bdText = "";
+                if(data.ai_analysis.score_breakdown) {
+                    for(const [key, val] of Object.entries(data.ai_analysis.score_breakdown)) {
+                        bdText += `${key}: ${val > 0 ? '+' : ''}${val.toFixed(2)}\n`;
+                    }
+                }
+                document.getElementById('res-breakdown').innerText = bdText;
 
                 setTimeout(() => {
                     document.getElementById('loading').style.display = 'none';
@@ -694,8 +723,53 @@
         async function showPortfolio() {
             document.getElementById('results-container').style.display = 'none';
             document.getElementById('backtest-results').style.display = 'none';
+            document.getElementById('watchlist-container').style.display = 'none';
             document.getElementById('portfolio-container').style.display = 'block';
             await loadPortfolio();
+        }
+        
+        async function showWatchlist() {
+            document.getElementById('results-container').style.display = 'none';
+            document.getElementById('backtest-results').style.display = 'none';
+            document.getElementById('portfolio-container').style.display = 'none';
+            document.getElementById('watchlist-container').style.display = 'block';
+            await loadWatchlist();
+        }
+        
+        async function loadWatchlist() {
+            try {
+                const res = await fetch('/api/watchlist');
+                const tickers = await res.json();
+                const container = document.getElementById('wl-list');
+                container.innerHTML = '';
+                for(let t of tickers) {
+                    container.innerHTML += `
+                        <div class="data-box" style="display: flex; justify-content: space-between; align-items: center;">
+                            <span style="font-weight: bold; color: var(--accent-cyan);">${t}</span>
+                            <button onclick="removeFromWatchlist('${t}')" style="background: var(--bearish); color: white; border: none; padding: 5px 10px; cursor: pointer;">X</button>
+                        </div>
+                    `;
+                }
+            } catch(e) { console.error(e); }
+        }
+        
+        async function addToWatchlist() {
+            const input = document.getElementById('wl-add-input');
+            const ticker = input.value.trim().toUpperCase();
+            if(ticker) {
+                await fetch('/api/watchlist', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ticker: ticker})
+                });
+                input.value = '';
+                await loadWatchlist();
+            }
+        }
+        
+        async function removeFromWatchlist(ticker) {
+            await fetch(`/api/watchlist/${ticker}`, { method: 'DELETE' });
+            await loadWatchlist();
         }
 
         async function runPortfolioTick() {

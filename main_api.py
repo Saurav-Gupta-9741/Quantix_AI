@@ -15,14 +15,18 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 import matplotlib
 matplotlib.use('Agg')
 import threading
+from transformers import pipeline
+import torch
+import torchvision.models as models
+from torchvision.transforms import functional as TF
+from io import BytesIO
 from contextlib import contextmanager
 from PIL import Image
 from torchvision import transforms
 from ticker_normalizer import TickerNormalizer
 from lstm_model import TradingLSTM
 from cnn_model import CandlestickCNN
-from sentiment_transformer import SentimentTransformer
-from rag_agent import RAGNewsAgent
+from news_sentiment_agent import NewsSentimentAgent
 from backtest import run_deep_learning_backtest
 from rl_agent import RLPortfolioManager
 from shared_state import init_db, get_conn, _db_lock, get_balance, update_balance
@@ -56,14 +60,15 @@ def startup_event():
     print("[+] QUANTIX: Auto-Take-Profit Risk Manager started in background.")
 
 normalizer = TickerNormalizer()
-sentiment_bot = SentimentTransformer()
-rag_agent = RAGNewsAgent(finbert_analyzer=sentiment_bot.analyzer)
+finbert = pipeline("sentiment-analysis", model="ProsusAI/finbert")
+news_agent = NewsSentimentAgent(finbert_analyzer=finbert)
 rl_manager = RLPortfolioManager()
 
 # Global Model Registry (F2 Fix)
 class ModelRegistry:
-    def __init__(self):
+    def __init__(self, finbert):
         self._models = {}
+        self.finbert = finbert
         
     def register(self, name, model, weights_path, device):
         if os.path.exists(weights_path):
@@ -87,7 +92,7 @@ class ModelRegistry:
         with torch.inference_mode():
             yield self._models[name]
 
-registry = ModelRegistry()
+registry = ModelRegistry(finbert)
 device = torch.device("cpu")
 
 registry.register("btc_lstm", TradingLSTM(input_size=5).to(device), os.path.join(os.path.dirname(__file__), "quantix_btc_lstm.pth"), device)
@@ -201,6 +206,11 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
 
     if live_data.empty:
         return {"error": f"No market data found for {clean_ticker}."}
+
+    # F1 Fix: Data Recency Check
+    last_date = live_data.index[-1].tz_localize(None)
+    if (datetime.now() - last_date).days > 5:
+        return {"error": f"Stale data for {clean_ticker}. Ticker may be halted or delisted."}
     
     live_data = calculate_technical_indicators(live_data)
     current_price = live_data['Close'].iloc[-1].item()
@@ -311,24 +321,24 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
     
     start_day = 15; end_day = 20 
     
+    # 3. News Sentiment NLP
     try:
-        sentiment_signal, rag_summary = rag_agent.analyze_fundamentals(clean_ticker)
+        finbert_signal, finbert_summary = news_agent.analyze_fundamentals(clean_ticker)
     except Exception as e:
-        sentiment_signal = "NEUTRAL"
-        rag_summary = f"[RAG AGENT ERROR]: {str(e)}"
+        finbert_signal, finbert_summary = "NEUTRAL", f"NLP Offline: {e}"
     
     recent_vol = float(live_data['Volume'].tail(3).mean())
     avg_vol = float(live_data['Volume'].mean())
     whale_detected = bool(recent_vol > (avg_vol * 1.5))
     
-    score = 0.0
-    if lstm_signal == "BULLISH": score += 0.4
-    elif lstm_signal == "BEARISH": score -= 0.4
-    if cnn_signal == "BULLISH": score += 0.3
-    elif cnn_signal == "BEARISH": score -= 0.3
-    if sentiment_signal == "BULLISH": score += 0.2
-    elif sentiment_signal == "BEARISH": score -= 0.2
-    if whale_detected: score -= 0.1
+    score_breakdown = {
+        "LSTM (40%)": 0.4 if lstm_signal == "BULLISH" else (-0.4 if lstm_signal == "BEARISH" else 0.0),
+        "CNN (30%)": 0.3 if cnn_signal == "BULLISH" else (-0.3 if cnn_signal == "BEARISH" else 0.0),
+        "FinBERT (30%)": 0.3 if finbert_signal == "BULLISH" else (-0.3 if finbert_signal == "BEARISH" else 0.0),
+        "Whale Penalty": -0.1 if whale_detected else 0.0
+    }
+    
+    score = sum(score_breakdown.values())
     
     if score >= 0.3: action = "BUY"
     elif score <= -0.3: action = "SELL"
@@ -358,11 +368,16 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
         "current_price": {"usd": round(price_usd, 2), "inr": round(price_inr, 2)},
         "filtered_data": {"asset_class": asset_class.replace('_', ' '), "beta_simulated": real_beta},
         "ai_analysis": {
-            "cnn_visual_pattern": f"{detected_pattern} (Grad-CAM: Day {start_day}-{end_day})",
             "lstm_predicted_price": {"usd": round(predicted_price_usd, 2), "inr": round(predicted_price_inr, 2)},
-            "finbert_sentiment": f"{sentiment_signal} (FinBERT Verified)",
-            "whale_manipulation_detected": whale_detected
+            "cnn_pattern": detected_pattern,
+            "llm_advisor_summary": finbert_summary,
+            "whale_manipulation_risk": "HIGH" if whale_detected else "LOW",
+            "score_breakdown": score_breakdown
         },
+        "strategy_summary": (
+            f"Based on a consensus score of {score:.2f}, the system recommends a {action}. "
+            f"Expected ROI: {roi_percent:.2f}%."
+        ),
         "execution_suggestion": {
             "signal": action,
             "expected_roi": f"{roi_percent:.2f}%",
@@ -372,7 +387,6 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
                 "inr": round(price_inr * (0.97 if action == 'BUY' else 1.03), 2)
             }
         },
-        "llm_advisor_summary": rag_summary,
         "prediction_method": prediction_method
     }
 

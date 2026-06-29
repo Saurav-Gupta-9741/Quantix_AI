@@ -7,12 +7,15 @@ from shared_state import get_conn, _db_lock, get_balance
 
 API_URL = "http://127.0.0.1:8000/api/analyze"
 
-WATCHLIST = [
-    "AAPL", "MSFT", "NVDA", "TSLA",
-    "BTC-USD", "ETH-USD",
-    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS",
-    "XOM", "CVX"
-]
+def get_watchlist():
+    watchlist = []
+    with _db_lock:
+        conn = get_conn()
+        cursor = conn.execute("SELECT ticker FROM watchlist")
+        for row in cursor.fetchall():
+            watchlist.append(row[0])
+        conn.close()
+    return watchlist
 
 def get_holdings():
     holdings = set()
@@ -57,7 +60,9 @@ def run_paper_trading_tick():
     balance = get_balance()
     new_signals_count = 0
     
-    for ticker in WATCHLIST:
+    watchlist = get_watchlist()
+    
+    for ticker in watchlist:
         print(f"[*] Analyzing {ticker}...")
         try:
             params = {

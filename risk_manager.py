@@ -6,11 +6,9 @@ from datetime import datetime
 from shared_state import get_conn, _db_lock, get_balance, update_balance
 from circuit_breaker import fetch_last_price
 
-TAKE_PROFIT_PCT = 5.0  # Sell if +5% profit
-
 def run_risk_manager():
-    print(f"\n[======== AUTO-TAKE-PROFIT MONITOR STARTED ========]")
-    print(f"Monitoring active holdings every 5 minutes. Take-Profit target: +{TAKE_PROFIT_PCT}%")
+    print(f"\n[======== AUTO-RISK-MANAGER STARTED ========]")
+    print(f"Monitoring active holdings every 5 minutes for Take-Profit and Stop-Loss triggers.")
     
     while True:
         try:
@@ -27,7 +25,7 @@ def run_risk_manager():
                 continue
                 
             for row in holdings:
-                ticker, qty, entry_price, total_cost, date = row
+                ticker, qty, entry_price, total_cost, date, sl_pct, tp_pct = row
                 try:
                     # Fetch live price
                     live_price = fetch_last_price(yf.Ticker(ticker))
@@ -36,10 +34,14 @@ def run_risk_manager():
                         
                     pnl_pct = ((live_price - entry_price) / entry_price) * 100
                     
-                    if pnl_pct >= TAKE_PROFIT_PCT:
+                    is_stop_loss = pnl_pct <= sl_pct
+                    is_take_profit = pnl_pct >= tp_pct
+                    
+                    if is_stop_loss or is_take_profit:
                         # EXECUTE AUTO-SELL
                         revenue = qty * live_price
                         profit = revenue - total_cost
+                        action_type = "Stop Loss" if is_stop_loss else "Take Profit"
                         
                         with _db_lock:
                             conn = get_conn()
@@ -47,7 +49,7 @@ def run_risk_manager():
                             update_balance(current_balance + revenue)
                             conn.execute("DELETE FROM holdings WHERE ticker=?", (ticker,))
                             
-                            log_msg = f"AUTO-SELL {ticker} (Take Profit triggered at +{pnl_pct:.2f}%): Profit ${profit:.2f}"
+                            log_msg = f"AUTO-SELL {ticker} ({action_type} triggered at {pnl_pct:.2f}%): Profit/Loss ${profit:.2f}"
                             conn.execute("INSERT INTO trade_history (log_msg, date) VALUES (?, ?)", 
                                          (log_msg, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
                             conn.commit()

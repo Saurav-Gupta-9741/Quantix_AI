@@ -4,9 +4,9 @@ import requests
 import json
 import os
 
-class RAGNewsAgent:
+class NewsSentimentAgent:
     def __init__(self, finbert_analyzer=None):
-        self.agent_name = "Quantix RAG Architect"
+        self.agent_name = "Quantix News Architect"
         self.finbert = finbert_analyzer  # Real FinBERT pipeline passed from main_api
 
     def analyze_fundamentals(self, ticker):
@@ -30,7 +30,7 @@ class RAGNewsAgent:
                     headlines.append(clean_title)
             
             if not headlines:
-                return "NEUTRAL", "[RAG AGENT]: No Google News found. Signal based purely on technical analysis."
+                return "NEUTRAL", "[NEWS AGENT]: No Google News found. Signal based purely on technical analysis."
             
             # Use REAL FinBERT transformer if available
             if self.finbert:
@@ -64,7 +64,7 @@ class RAGNewsAgent:
                     
                     headline_summary = ' | '.join(headlines[:3])
                     summary = (
-                        f"[RAG AGENT]: FinBERT analyzed {len(headlines)} real-time headlines. "
+                        f"[NEWS AGENT]: FinBERT analyzed {len(headlines)} real-time headlines. "
                         f"Sentiment: {sentiment} ({confidence:.0f}% confidence). "
                         f"Bull: {bull_score:.2f} | Bear: {bear_score:.2f} | Neutral: {neutral_score:.2f}. "
                         f"Headlines: {headline_summary}"
@@ -97,7 +97,7 @@ class RAGNewsAgent:
             
             headline_summary = ' | '.join(headlines[:3])
             summary = (
-                f"[RAG AGENT]: Analyzed {len(headlines)} real headlines (keyword mode). "
+                f"[NEWS AGENT]: Analyzed {len(headlines)} real headlines (keyword mode). "
                 f"Sentiment: {sentiment}. Bull signals: {bull_score}, Bear signals: {bear_score}. "
                 f"Headlines: {headline_summary}"
             )
@@ -107,7 +107,7 @@ class RAGNewsAgent:
             return "NEUTRAL", f"[RAG AGENT ERROR]: {str(e)}"
 
 if __name__ == "__main__":
-    agent = RAGNewsAgent()
+    agent = NewsSentimentAgent()
     sentiment, summary = agent.analyze_fundamentals("AAPL")
     print(f"Sentiment: {sentiment}")
     print(f"Summary: {summary}")
