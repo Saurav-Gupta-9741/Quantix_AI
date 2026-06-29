@@ -1,12 +1,10 @@
 import os
-import json
 import time
 import requests
 import yfinance as yf
 from datetime import datetime
+from shared_state import get_conn, _db_lock, get_balance
 
-PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio.json")
-SIGNALS_FILE = os.path.join(os.path.dirname(__file__), "signals.json")
 API_URL = "http://127.0.0.1:8000/api/analyze"
 
 WATCHLIST = [
@@ -16,32 +14,48 @@ WATCHLIST = [
     "XOM", "CVX"
 ]
 
-def load_portfolio():
-    if not os.path.exists(PORTFOLIO_FILE):
-        return {"balance_usd": 100000.0, "holdings": {}, "trade_history": []}
-    with open(PORTFOLIO_FILE, "r") as f:
-        return json.load(f)
+def get_holdings():
+    holdings = set()
+    with _db_lock:
+        conn = get_conn()
+        cursor = conn.execute("SELECT ticker FROM holdings")
+        for row in cursor.fetchall():
+            holdings.add(row[0])
+        conn.close()
+    return holdings
 
-def save_portfolio(data):
-    with open(PORTFOLIO_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+def get_signals():
+    signals = set()
+    with _db_lock:
+        conn = get_conn()
+        cursor = conn.execute("SELECT ticker FROM signals")
+        for row in cursor.fetchall():
+            signals.add(row[0])
+        conn.close()
+    return signals
 
-def load_signals():
-    if not os.path.exists(SIGNALS_FILE):
-        return []
-    with open(SIGNALS_FILE, "r") as f:
-        return json.load(f)
-
-def save_signals(data):
-    with open(SIGNALS_FILE, "w") as f:
-        json.dump(data, f, indent=4)
+def insert_signal(sig_obj):
+    with _db_lock:
+        conn = get_conn()
+        conn.execute("""
+            INSERT OR REPLACE INTO signals 
+            (ticker, signal, confidence, predicted_roi, current_price, recommended_qty, cost, date) 
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            sig_obj['ticker'], sig_obj['signal'], sig_obj['confidence'], 
+            sig_obj['predicted_roi'], sig_obj['current_price'], 
+            sig_obj['recommended_qty'], sig_obj['cost'], sig_obj['date']
+        ))
+        conn.commit()
+        conn.close()
 
 def run_paper_trading_tick():
-    import concurrent.futures
     print(f"\n[======== PAPER TRADING TICK - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ========]")
-    portfolio = load_portfolio()
-    current_signals = load_signals()
-    new_signals = []
+    
+    current_holdings = get_holdings()
+    current_signals = get_signals()
+    balance = get_balance()
+    new_signals_count = 0
     
     for ticker in WATCHLIST:
         print(f"[*] Analyzing {ticker}...")
@@ -68,57 +82,29 @@ def run_paper_trading_tick():
             rl_size_str = data['execution_suggestion']['rl_position_size'].replace('%', '')
             rl_size = float(rl_size_str) / 100.0
             
-            if signal == "BUY" and ticker not in portfolio['holdings']:
-                allocate_amount = portfolio['balance_usd'] * rl_size
+            if signal == "BUY" and ticker not in current_holdings:
+                allocate_amount = balance * rl_size
                 if allocate_amount > 100:
                     qty = allocate_amount / current_price
                     sig_obj = {
                         "ticker": ticker,
                         "signal": "BUY",
                         "confidence": data.get("strategy_summary", "").split("Confidence:")[0][-5:] if "Confidence" in data.get("strategy_summary", "") else "High",
-                        "predicted_roi": data.get("deep_learning_analysis", {}).get("lstm_expected_roi", "0.0%"),
+                        "predicted_roi": data.get("ai_analysis", {}).get("lstm_predicted_price", {}).get("usd", "0.0"),
                         "current_price": current_price,
                         "recommended_qty": qty,
                         "cost": allocate_amount,
                         "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
                     }
                     
-                    if not any(s['ticker'] == ticker for s in current_signals) and not any(s['ticker'] == ticker for s in new_signals):
-                        new_signals.append(sig_obj)
+                    if ticker not in current_signals:
+                        insert_signal(sig_obj)
+                        new_signals_count += 1
                         print(f"[+] SIGNAL GENERATED: {ticker}")
         except Exception as e:
             print(f"[-] Error processing {ticker}: {e}")
             
-    # Calculate Total Equity
-    total_equity = portfolio['balance_usd']
-    for tkr, data in portfolio['holdings'].items():
-        try:
-            live_price = float(yf.Ticker(tkr).fast_info.last_price)
-            if "NS" in tkr.upper() or "BO" in tkr.upper():
-                live_price = live_price / 83.5
-            total_equity += data['qty'] * live_price
-        except:
-            total_equity += data['total_cost']  # fallback to cost basis
-            
-    # Record equity history
-    if 'equity_history' not in portfolio:
-        portfolio['equity_history'] = []
-    
-    portfolio['equity_history'].append({
-        "date": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-        "equity": total_equity
-    })
-    
-    # Keep history clean
-    portfolio['trade_history'] = portfolio['trade_history'][:50]
-    
-    save_portfolio(portfolio)
-    
-    # Save active pending signals
-    all_signals = current_signals + new_signals
-    save_signals(all_signals)
-    
-    print(f"[!] Tick Complete. New Signals Generated: {len(new_signals)}")
+    print(f"[!] Tick Complete. New Signals Generated: {new_signals_count}")
 
 if __name__ == "__main__":
     run_paper_trading_tick()

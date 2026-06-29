@@ -583,6 +583,17 @@
         tickerInput.addEventListener('blur', () => { setTimeout(() => acList.style.display = 'none', 150); });
 
         let currentWs = null;
+        
+        // F4: Server-Sent Events (SSE) for Real-Time UI Updates
+        const evtSource = new EventSource("/api/stream");
+        evtSource.onmessage = function(event) {
+            const data = JSON.parse(event.data);
+            if (data.type === "refresh") {
+                if (document.getElementById('portfolio-container').style.display === 'block') {
+                    loadPortfolio(); // Instantly update if user is looking at it
+                }
+            }
+        };
 
         async function runAnalysis() {
             // Strip any HTML tags from ticker before sending

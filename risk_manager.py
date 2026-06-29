@@ -1,21 +1,11 @@
 import os
-import json
 import time
+import requests
 import yfinance as yf
 from datetime import datetime
+from shared_state import get_conn, _db_lock, get_balance, update_balance
 
-PORTFOLIO_FILE = os.path.join(os.path.dirname(__file__), "portfolio.json")
 TAKE_PROFIT_PCT = 5.0  # Sell if +5% profit
-
-def load_portfolio():
-    if not os.path.exists(PORTFOLIO_FILE):
-        return None
-    with open(PORTFOLIO_FILE, "r") as f:
-        return json.load(f)
-
-def save_portfolio(data):
-    with open(PORTFOLIO_FILE, "w") as f:
-        json.dump(data, f, indent=4)
 
 def run_risk_manager():
     print(f"\n[======== AUTO-TAKE-PROFIT MONITOR STARTED ========]")
@@ -23,36 +13,44 @@ def run_risk_manager():
     
     while True:
         try:
-            portfolio = load_portfolio()
-            if not portfolio or not portfolio.get("holdings"):
+            sold_something = False
+            
+            with _db_lock:
+                conn = get_conn()
+                cursor = conn.execute("SELECT * FROM holdings")
+                holdings = cursor.fetchall()
+                conn.close()
+                
+            if not holdings:
                 time.sleep(300)
                 continue
                 
-            holdings = portfolio["holdings"]
-            sold_something = False
-            
-            for ticker, data in list(holdings.items()):
+            for row in holdings:
+                ticker, qty, entry_price, total_cost, date = row
                 try:
                     # Fetch live price
                     live_price = float(yf.Ticker(ticker).fast_info.last_price)
                     if "NS" in ticker.upper() or "BO" in ticker.upper():
                         live_price = live_price / 83.5
                         
-                    entry_price = data['entry_price']
-                    qty = data['qty']
-                    
                     pnl_pct = ((live_price - entry_price) / entry_price) * 100
                     
                     if pnl_pct >= TAKE_PROFIT_PCT:
                         # EXECUTE AUTO-SELL
                         revenue = qty * live_price
-                        profit = revenue - data['total_cost']
+                        profit = revenue - total_cost
                         
-                        portfolio['balance_usd'] += revenue
-                        del portfolio['holdings'][ticker]
-                        
-                        log_msg = f"AUTO-SELL {ticker} (Take Profit triggered at +{pnl_pct:.2f}%): Profit ${profit:.2f}"
-                        portfolio['trade_history'].insert(0, log_msg)
+                        with _db_lock:
+                            conn = get_conn()
+                            current_balance = get_balance()
+                            update_balance(current_balance + revenue)
+                            conn.execute("DELETE FROM holdings WHERE ticker=?", (ticker,))
+                            
+                            log_msg = f"AUTO-SELL {ticker} (Take Profit triggered at +{pnl_pct:.2f}%): Profit ${profit:.2f}"
+                            conn.execute("INSERT INTO trade_history (log_msg, date) VALUES (?, ?)", 
+                                         (log_msg, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+                            conn.commit()
+                            conn.close()
                         
                         print(f"[!] {datetime.now().strftime('%H:%M:%S')} | {log_msg}")
                         sold_something = True
@@ -61,8 +59,10 @@ def run_risk_manager():
                     print(f"[-] Error tracking {ticker}: {e}")
                     
             if sold_something:
-                portfolio['trade_history'] = portfolio['trade_history'][:50]
-                save_portfolio(portfolio)
+                try:
+                    requests.post("http://127.0.0.1:8000/api/trigger_refresh")
+                except:
+                    pass
                 
         except Exception as e:
             print(f"[-] Risk Manager Error: {e}")
