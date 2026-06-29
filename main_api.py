@@ -26,6 +26,7 @@ from rag_agent import RAGNewsAgent
 from backtest import run_deep_learning_backtest
 from rl_agent import RLPortfolioManager
 from shared_state import init_db, get_conn, _db_lock, get_balance, update_balance
+from circuit_breaker import fetch_history, fetch_last_price
 import json
 from datetime import datetime
 
@@ -193,7 +194,11 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
     print(f"\n[>>>] INCOMING QUERY: {ticker}")
     clean_ticker = normalizer.normalize(ticker)
     
-    live_data = yf.Ticker(clean_ticker).history(period="80d", interval="1d")
+    try:
+        live_data = fetch_history(yf.Ticker(clean_ticker), period="80d", interval="1d")
+    except Exception as e:
+        return {"error": str(e)}
+
     if live_data.empty:
         return {"error": f"No market data found for {clean_ticker}."}
     
@@ -337,7 +342,7 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
     
     real_beta = "Dynamic"
     try:
-        spy_data = yf.Ticker("SPY").history(period="60d", interval="1d")
+        spy_data = fetch_history(yf.Ticker("SPY"), period="60d", interval="1d")
         if not spy_data.empty and len(spy_data) > 10:
             asset_returns = live_data['Close'].pct_change().dropna().tail(30)
             market_returns = spy_data['Close'].pct_change().dropna().tail(30)
@@ -375,7 +380,7 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
 def backtest_ticker(ticker: str):
     clean_ticker = normalizer.normalize(ticker)
     try:
-        df = yf.Ticker(clean_ticker).history(period="1y", interval="1d")
+        df = fetch_history(yf.Ticker(clean_ticker), period="1y", interval="1d")
         if df.empty: return {"error": "No historical data found."}
         df = calculate_technical_indicators(df)
         is_inr_native = "NS" in clean_ticker.upper() or "BO" in clean_ticker.upper()
@@ -409,7 +414,7 @@ def get_portfolio():
         for row in cursor.fetchall():
             ticker, qty, entry_price, total_cost, date = row
             try:
-                live_price = float(yf.Ticker(ticker).fast_info.last_price)
+                live_price = fetch_last_price(yf.Ticker(ticker))
                 if "NS" in ticker.upper() or "BO" in ticker.upper():
                     live_price = live_price / 83.5
                 unrealized_pnl = (live_price - entry_price) * qty
@@ -493,14 +498,14 @@ async def websocket_endpoint(websocket: WebSocket, ticker: str):
     clean_ticker = normalizer.normalize(ticker)
     try:
         ticker_obj = yf.Ticker(clean_ticker)
-        base_price = ticker_obj.fast_info.last_price
+        base_price = fetch_last_price(ticker_obj)
     except:
         base_price = 1000.0
 
     try:
         while True:
             try:
-                live_price = float(yf.Ticker(clean_ticker).fast_info.last_price)
+                live_price = fetch_last_price(yf.Ticker(clean_ticker))
             except:
                 live_price = base_price
             await websocket.send_json({'ticker': ticker, 'live_price': round(live_price, 2)})

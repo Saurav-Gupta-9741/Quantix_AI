@@ -4,6 +4,7 @@ import requests
 import yfinance as yf
 from datetime import datetime
 from shared_state import get_conn, _db_lock, get_balance, update_balance
+from circuit_breaker import fetch_last_price
 
 TAKE_PROFIT_PCT = 5.0  # Sell if +5% profit
 
@@ -29,7 +30,7 @@ def run_risk_manager():
                 ticker, qty, entry_price, total_cost, date = row
                 try:
                     # Fetch live price
-                    live_price = float(yf.Ticker(ticker).fast_info.last_price)
+                    live_price = fetch_last_price(yf.Ticker(ticker))
                     if "NS" in ticker.upper() or "BO" in ticker.upper():
                         live_price = live_price / 83.5
                         
