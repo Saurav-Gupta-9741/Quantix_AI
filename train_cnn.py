@@ -6,16 +6,13 @@ from torchvision import transforms
 from PIL import Image
 import os
 import glob
+import hashlib
 from cnn_model import CandlestickCNN
 
 class CandlestickDataset(Dataset):
     def __init__(self, image_dir, transform=None):
         self.image_paths = glob.glob(os.path.join(image_dir, "*.png"))
         self.transform = transform
-        
-        # In a real environment, you need labels (e.g., 0 for Bearish, 1 for Bullish).
-        # Since we generated blind images, we will simulate labels based on the filename or price action.
-        # For this training script, we assign dummy labels (random 0, 1, 2 for patterns).
         print(f"[*] Found {len(self.image_paths)} candlestick images in {image_dir}")
 
     def __len__(self):
@@ -28,10 +25,15 @@ class CandlestickDataset(Dataset):
         if self.transform:
             image = self.transform(image)
             
-        # Simulating a label for the pattern (0: Bull Flag, 1: Bear Flag, 2: Consolidation)
-        # In production, this label comes from the future price movement (e.g., if price went up 5% next week, label=0)
-        simulated_label = torch.randint(0, 3, (1,)).item()
-        return image, simulated_label
+        # F2 Fix & Bug Fix: 
+        # Using a deterministic label based on the filename so the model can actually overfit 
+        # and learn instead of getting random noise every epoch. 
+        # In a real pipeline, this would be replaced by joining with a CSV of future returns.
+        filename = os.path.basename(img_path)
+        stable_hash = int(hashlib.md5(filename.encode()).hexdigest(), 16)
+        label = stable_hash % 5  # 5 classes: Bull Flag, Bear Flag, H&S, Double Bottom, Consolidation
+        
+        return image, label
 
 class CNNTrainer:
     def __init__(self, num_classes=5):
@@ -73,20 +75,24 @@ class CNNTrainer:
                 
                 total_loss += loss.item()
                 
-            avg_loss = total_loss / len(self.dataloader)
-            print(f"Epoch [{epoch+1}/{epochs}] | Loss: {avg_loss:.4f}")
-            
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                torch.save(self.model.state_dict(), save_path)
+            if len(self.dataloader) > 0:
+                avg_loss = total_loss / len(self.dataloader)
+                print(f"Epoch [{epoch+1}/{epochs}] | Loss: {avg_loss:.4f}")
+                
+                if avg_loss < best_loss:
+                    best_loss = avg_loss
+                    torch.save(self.model.state_dict(), save_path)
+            else:
+                print("No data in dataloader")
+                break
                 
         print(f"\n[+] Vision Training Complete! Weights saved to: {save_path}")
 
 if __name__ == "__main__":
     print("--- QUANTIX AI: CNN GPU TRAINER ---")
     
-    # Example execution for Colab
-    trainer = CNNTrainer(num_classes=3)
+    # F2 Fix: 5 classes to match the implementation plan and `cnn_model.py`
+    trainer = CNNTrainer(num_classes=5)
     
     # We point it to the dataset we generated in Phase 2
     trainer.load_data("dataset_btc_images")

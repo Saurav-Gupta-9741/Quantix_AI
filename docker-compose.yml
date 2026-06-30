@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  quantix-api:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./quantix.db:/app/quantix.db
+      - ./quantix_btc_lstm.pth:/app/quantix_btc_lstm.pth
+      - ./quantix_nifty_lstm.pth:/app/quantix_nifty_lstm.pth
+      - ./quantix_cnn_v1.pth:/app/quantix_cnn_v1.pth
+      - ./feature_scaler.pkl:/app/feature_scaler.pkl
+      - ./target_scaler.pkl:/app/target_scaler.pkl
+    environment:
+      - QUANTIX_API_KEY=production_key_here
+      - EXCHANGE_RATE_FALLBACK=83.5
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3

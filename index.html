@@ -7,7 +7,7 @@
     <script src="https://unpkg.com/lightweight-charts@3.8.0/dist/lightweight-charts.standalone.production.js"></script>
     <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;700&family=Inter:wght@300;500;700&display=swap" rel="stylesheet">
     <style>
-        :root {
+:root {
             --bg-base: #000000;
             --panel-bg: #090b10;
             --border-dim: #1f2430;
@@ -17,8 +17,32 @@
             --accent-cyan: #06b6d4;
             --bullish: #10b981;
             --bearish: #ef4444;
+            --accent-color: #06b6d4;
+            --border-color: #1f2430;
+            --text-muted: #6b7280;
+            --bg-panel: #090b10;
+            --buy-color: #10b981;
             --font-ui: 'Inter', sans-serif;
             --font-mono: 'JetBrains Mono', monospace;
+        }
+
+        @media (max-width: 1024px) {
+            body {
+                grid-template-columns: 250px 1fr;
+            }
+        }
+        @media (max-width: 768px) {
+            body {
+                grid-template-columns: 1fr;
+                grid-template-rows: 50px auto 1fr;
+                overflow: auto;
+            }
+            .sidebar {
+                max-height: 400px;
+            }
+            .data-grid {
+                grid-template-columns: 1fr;
+            }
         }
 
         body {
@@ -317,10 +341,10 @@
             QUANTIX <span>AI TERMINAL</span>
         </div>
         <div>
-            <div style="font-size: 12px; color: var(--text-muted); letter-spacing: 2px; text-align: right; margin-bottom: 5px;">SYS.STATUS : <span style="color: var(--buy-color);">ONLINE</span></div>
-            <div style="font-size: 10px; color: var(--border-color);">LATENCY: 12ms | CLUSTER: ALPHA-9</div>
+            <div style="font-size: 12px; color: var(--text-muted); letter-spacing: 2px; text-align: right; margin-bottom: 5px;">SYS.STATUS : <span id="sys-status-val" style="color: var(--buy-color);">ONLINE</span></div>
+            <div id="sys-metrics-val" style="font-size: 10px; color: var(--border-color);">LATENCY: 12ms | CLUSTER: ALPHA-9</div>
         </div>
-        <button class="info-btn" onclick="openModal()">i</button>
+        <button class="info-btn" aria-label="Open Guide" onclick="openModal()">i</button>
     </div>
 
     <!-- LEFT SIDEBAR: ADVANCED QUANTITATIVE FILTERS -->
@@ -369,7 +393,7 @@
         <div class="filter-group">
             <label>Time Horizon</label>
             <select id="timeframe">
-                <option value="HFT">High-Frequency (Microsecond)</option>
+                <option value="scalp">Scalp (Minutes)</option>
                 <option value="intraday">Intraday (Mins/Hours)</option>
                 <option value="swing" selected>Swing (Days/Weeks)</option>
                 <option value="macro">Macro (Months)</option>
@@ -384,12 +408,12 @@
             </select>
         </div>
 
-        <button class="run-btn" onclick="runAnalysis()">EXECUTE ANALYSIS</button>
-        <button class="run-btn" style="background: #059669; margin-top: 10px;" onclick="runBacktest()">RUN 1-YEAR BACKTEST</button>
+        <button class="run-btn" aria-label="Execute Analysis" onclick="runAnalysis()">EXECUTE ANALYSIS</button>
+        <button class="run-btn" aria-label="Run 1-Year Backtest" style="background: #059669; margin-top: 10px;" onclick="runBacktest()">RUN 1-YEAR BACKTEST</button>
         
         <h3 style="margin-top: 30px;">Automation</h3>
-        <button class="run-btn" style="background: #6366f1; border-left: 4px solid #a5b4fc;" onclick="showPortfolio()">🏦 PAPER TRADING PORTFOLIO</button>
-        <button class="run-btn" style="background: #475569; margin-top: 10px;" onclick="showWatchlist()">📋 MANAGE WATCHLIST</button>
+        <button class="run-btn" aria-label="Open Paper Trading Portfolio" style="background: #6366f1; border-left: 4px solid #a5b4fc;" onclick="showPortfolio()">🏦 PAPER TRADING PORTFOLIO</button>
+        <button class="run-btn" aria-label="Manage Watchlist" style="background: #475569; margin-top: 10px;" onclick="showWatchlist()">📋 MANAGE WATCHLIST</button>
     </div>
 
     <!-- MAIN DASHBOARD -->
@@ -486,6 +510,11 @@
                     <span class="data-box-val" id="res-class" style="text-transform: uppercase;">---</span>
                 </div>
 
+                <!-- Fallback Banner -->
+                <div id="fallback-banner" style="grid-column: 1 / -1; display: none; background: #991b1b; color: white; padding: 10px; border-left: 4px solid #ef4444; font-family: var(--font-mono); font-size: 0.9em; margin-bottom: 10px;">
+                    ⚠️ <strong>LSTM SUPPRESSED</strong> — Operating on Technical Analysis Fallback due to model drift.
+                </div>
+
                 <!-- Central Signal Engine -->
                 <div class="signal-box">
                     <div id="res-signal" class="signal-text">---</div>
@@ -494,6 +523,11 @@
                         <div style="margin-top: 10px;"><span style="color: var(--text-dim);">POSITION SIZE (RL):</span> <span id="res-rl" style="color: var(--accent-cyan);">0.00%</span></div>
                         <div style="margin-top: 10px;"><span style="color: var(--text-dim);">STOP LOSS (AUTO):</span> <span id="res-stop" class="sell-color">$0.00</span></div>
                     </div>
+                </div>
+                
+                <div id="gradcam-container" style="grid-column: 1 / -1; display: none; text-align: center; border: 1px solid var(--border-dim); padding: 10px; background: #000;">
+                    <div style="color: var(--accent-cyan); margin-bottom: 10px; font-weight: bold; font-family: var(--font-mono);">> CNN GRAD-CAM ACTIVATION HEATMAP</div>
+                    <img id="res-gradcam" src="" style="width: 224px; height: 224px; border: 1px solid var(--border-dim);" alt="Grad-CAM Heatmap">
                 </div>
             </div>
 
@@ -518,10 +552,10 @@
     </div>
 
     <!-- INFO MODAL -->
-    <div class="modal-overlay" id="guideModal">
+    <div class="modal-overlay" id="guideModal" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
         <div class="modal-content">
-            <button class="modal-close" onclick="closeModal()">×</button>
-            <div class="modal-title">QUANTIX AI: OPERATIONAL GUIDE</div>
+            <button class="modal-close" aria-label="Close Guide" onclick="closeModal()">×</button>
+            <div class="modal-title" id="modalTitle">QUANTIX AI: OPERATIONAL GUIDE</div>
             <div class="modal-text">
                 <h3>1. THE ENSEMBLE ENGINE (How it thinks)</h3>
                 <p>When you click Execute, three separate Neural Networks analyze the asset simultaneously. A signal is only generated if all three models reach consensus.</p>
@@ -554,15 +588,15 @@
                 stocksArray.forEach(s => {
                     const li = document.createElement('li');
                     
-                    const badgeHtml = s.type ? `<span class="ac-exchange-badge">${s.type}</span>` : '';
+                    const badgeHtml = s.type ? `<span class="ac-exchange-badge">${escapeHtml(s.type)}</span>` : '';
                     const displaySymbol = s.display_symbol || s.ticker;
                     
                     li.innerHTML = `
                         <div>
-                            <span class="ac-ticker">${displaySymbol}</span>
+                            <span class="ac-ticker">${escapeHtml(displaySymbol)}</span>
                             ${badgeHtml}
                         </div>
-                        <span class="ac-name">${s.name}</span>
+                        <span class="ac-name">${escapeHtml(s.name)}</span>
                     `;
                     
                     li.onmousedown = () => { // mousedown fires before blur
@@ -590,8 +624,14 @@
             }
         }
 
-        // Strip HTML tags injected by browser extensions (e.g. dictionary popups)
+// Strip HTML tags injected by browser extensions (e.g. dictionary popups)
         function stripHtml(str) { return str.replace(/<[^>]+>/g, '').trim(); }
+        
+        // Escape HTML to prevent XSS in innerHTML
+        function escapeHtml(unsafe) {
+            if (unsafe == null) return "";
+            return unsafe.toString().replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
+        }
         
         tickerInput.addEventListener('focus', () => renderAutocomplete(tickerInput.value.toLowerCase()));
         tickerInput.addEventListener('input', (e) => {
@@ -603,18 +643,62 @@
         });
         tickerInput.addEventListener('blur', () => { setTimeout(() => acList.style.display = 'none', 150); });
 
+
+        // F12: Real metrics
+        async function fetchHealth() {
+            try {
+                const res = await fetch('/api/health');
+                const data = await res.json();
+                document.getElementById('sys-status-val').innerText = data.status;
+                document.getElementById('sys-status-val').style.color = data.status === 'ONLINE' ? 'var(--buy-color)' : 'var(--bearish)';
+                document.getElementById('sys-metrics-val').innerText = `LATENCY: ${data.latency} | CLUSTER: ${data.cluster}`;
+            } catch(e) {
+                document.getElementById('sys-status-val').innerText = 'OFFLINE';
+                document.getElementById('sys-status-val').style.color = 'var(--bearish)';
+                document.getElementById('sys-metrics-val').innerText = 'LATENCY: ERR | CLUSTER: NONE';
+            }
+        }
+        setInterval(fetchHealth, 60000); // Check every minute
+        fetchHealth();
+        
+        // Generate a unique client ID per session for SSE multiplexing
+        const clientId = Math.random().toString(36).substring(2, 15);
+        let sseReconnectMs = 1000;
+        let evtSource = null;
         let currentWs = null;
         
-        // F4: Server-Sent Events (SSE) for Real-Time UI Updates
-        const evtSource = new EventSource("/api/stream");
-        evtSource.onmessage = function(event) {
-            const data = JSON.parse(event.data);
-            if (data.type === "refresh") {
-                if (document.getElementById('portfolio-container').style.display === 'block') {
-                    loadPortfolio(); // Instantly update if user is looking at it
+        function connectSSE() {
+            evtSource = new EventSource("/api/stream?client_id=" + clientId);
+            evtSource.onmessage = function(event) {
+                const data = JSON.parse(event.data);
+                if (data.type === "refresh") {
+                    if (document.getElementById('portfolio-container').style.display === 'block') {
+                        loadPortfolio(); // Instantly update if user is looking at it
+                    }
+                } else if (data.type === "price_tick") {
+                    const priceEl = document.getElementById('res-price');
+                    if (priceEl && document.getElementById('results-container').style.display === 'block') {
+                        let currencySymbol = "$";
+                        if (data.ticker.includes('.NS') || data.ticker.includes('.BO')) {
+                            currencySymbol = "₹";
+                        }
+                        priceEl.innerText = currencySymbol + data.price.toLocaleString();
+                        priceEl.style.color = '#fff';
+                        setTimeout(() => priceEl.style.color = 'var(--bullish)', 200);
+                    }
                 }
-            }
-        };
+            };
+            evtSource.onerror = function(err) {
+                console.error("SSE Error. Reconnecting...", err);
+                evtSource.close();
+                setTimeout(connectSSE, sseReconnectMs);
+                sseReconnectMs = Math.min(sseReconnectMs * 2, 30000);
+            };
+            evtSource.onopen = function() {
+                sseReconnectMs = 1000;
+            };
+        }
+        connectSSE();
 
         async function runAnalysis() {
             // Strip any HTML tags from ticker before sending
@@ -681,13 +765,31 @@
                 // LLM Text & Breakdown
                 document.getElementById('res-llm').innerText = data.ai_analysis.llm_advisor_summary;
                 
-                let bdText = "";
+                if (data.gradcam_base64) {
+                    document.getElementById('gradcam-container').style.display = 'block';
+                    document.getElementById('res-gradcam').src = 'data:image/png;base64,' + data.gradcam_base64;
+                } else {
+                    document.getElementById('gradcam-container').style.display = 'none';
+                }
+                
+                if (data.ai_analysis.is_fallback_mode) {
+                    document.getElementById('fallback-banner').style.display = 'block';
+                } else {
+                    document.getElementById('fallback-banner').style.display = 'none';
+                }
+                
+                let bdText = `<div style="display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 10px;">`;
                 if(data.ai_analysis.score_breakdown) {
                     for(const [key, val] of Object.entries(data.ai_analysis.score_breakdown)) {
-                        bdText += `${key}: ${val > 0 ? '+' : ''}${val.toFixed(2)}\n`;
+                        let color = val > 0 ? 'var(--buy-color)' : (val < 0 ? '#ef4444' : 'var(--text-dim)');
+                        bdText += `<div style="background: #111; padding: 5px; border: 1px solid var(--border-dim); border-left: 3px solid ${color};">
+                                    <span style="color: var(--text-dim);">${key}</span><br>
+                                    <strong style="color: ${color};">${val > 0 ? '+' : ''}${val.toFixed(2)}</strong>
+                                   </div>`;
                     }
                 }
-                document.getElementById('res-breakdown').innerText = bdText;
+                bdText += `</div>`;
+                document.getElementById('res-breakdown').innerHTML = bdText;
 
                 setTimeout(() => {
                     document.getElementById('loading').style.display = 'none';
@@ -695,23 +797,13 @@
                     document.getElementById('results-container').style.display = 'block';
                     document.getElementById('backtest-results').style.display = 'none'; // hide backtest on new search
                     
-                    // Connect WebSocket for Live Price
-                    currentWs = new WebSocket(`ws://${window.location.host}/ws/live_prices/${params.get('ticker')}`);
-                    currentWs.onmessage = function(event) {
-                        const wsData = JSON.parse(event.data);
-                        const priceEl = document.getElementById('res-price');
-                        
-                        let currencySymbol = "$";
-                        if (params.get('ticker').includes('.NS') || params.get('ticker').includes('.BO')) {
-                            currencySymbol = "₹";
-                        }
-                        
-                        priceEl.innerText = currencySymbol + wsData.live_price.toLocaleString();
-                        
-                        // Flash effect
-                        priceEl.style.color = '#fff';
-                        setTimeout(() => priceEl.style.color = 'var(--bullish)', 200);
-                    };
+                    // Subscribe to price ticks over SSE, passing client_id for multiplexing
+                    fetch('/api/subscribe_price', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ ticker: params.get('ticker'), client_id: clientId })
+                    }).catch(err => console.error("Error subscribing to price ticks", err));
+                    
                 }, 600);
 
             } catch (err) {
@@ -745,8 +837,8 @@
                 for(let t of tickers) {
                     container.innerHTML += `
                         <div class="data-box" style="display: flex; justify-content: space-between; align-items: center;">
-                            <span style="font-weight: bold; color: var(--accent-cyan);">${t}</span>
-                            <button onclick="removeFromWatchlist('${t}')" style="background: var(--bearish); color: white; border: none; padding: 5px 10px; cursor: pointer;">X</button>
+                            <span style="font-weight: bold; color: var(--accent-cyan);">${escapeHtml(t)}</span>
+                            <button onclick="removeFromWatchlist('${escapeHtml(t)}')" style="background: var(--bearish); color: white; border: none; padding: 5px 10px; cursor: pointer;">X</button>
                         </div>
                     `;
                 }
@@ -803,14 +895,14 @@
                     signals.forEach(sig => {
                         signalsDiv.innerHTML += `
                             <div style="border: 1px solid var(--accent-cyan); padding: 15px; border-radius: 8px; background: rgba(6, 182, 212, 0.05);">
-                                <h3 style="margin-top:0; color: var(--accent-cyan);">${sig.ticker} <span style="font-size:0.7em; float:right;">Confidence: ${sig.confidence}</span></h3>
-                                <p style="margin-bottom: 5px;"><strong>Predicted ROI:</strong> <span style="color: var(--bullish);">${sig.predicted_roi}</span></p>
+                                <h3 style="margin-top:0; color: var(--accent-cyan);">${escapeHtml(sig.ticker)} <span style="font-size:0.7em; float:right;">Confidence: ${escapeHtml(sig.confidence)}</span></h3>
+                                <p style="margin-bottom: 5px;"><strong>Predicted ROI:</strong> <span style="color: var(--bullish);">${escapeHtml(sig.predicted_roi)}</span></p>
                                 <p style="margin-top: 0; color: var(--text-dim); font-size: 0.9em;">
                                     QTY: ${sig.recommended_qty.toFixed(2)}<br>
                                     PRICE: $${sig.current_price.toFixed(2)}<br>
                                     COST: $${sig.cost.toFixed(2)}
                                 </p>
-                                <button onclick="executeTrade('${sig.ticker}')" style="width: 100%; background: var(--bullish); color: white; border: none; padding: 8px; border-radius: 4px; cursor: pointer; font-weight: bold; margin-top: 10px;">
+                                <button onclick="executeTrade('${escapeHtml(sig.ticker)}')" style="width: 100%; background: var(--bullish); color: white; border: none; padding: 8px; border-radius: 4px; cursor: pointer; font-weight: bold; margin-top: 10px;">
                                     APPROVE & BUY
                                 </button>
                             </div>
@@ -828,7 +920,7 @@
                     holdingsDiv.innerHTML += `
                         <div style="border: 1px solid #1e293b; padding: 15px; border-radius: 8px;">
                             <h3 style="margin-top:0; display:flex; justify-content:space-between;">
-                                <span>${ticker}</span>
+                                <span>${escapeHtml(ticker)}</span>
                                 <span style="color: ${pnlColor}; font-size: 0.9em;">
                                     ${pnlSign}$${details.unrealized_pnl.toFixed(2)} (${pnlSign}${details.pnl_pct.toFixed(2)}%)
                                 </span>
@@ -845,12 +937,12 @@
                 const historyDiv = document.getElementById('port-history');
                 historyDiv.innerHTML = '';
                 data.trade_history.forEach(log => {
-                    historyDiv.innerHTML += `<div style="margin-bottom: 5px;">> ${log}</div>`;
+                    historyDiv.innerHTML += `<div style="margin-bottom: 5px;">> ${escapeHtml(log)}</div>`;
                 });
                 
                 // Analytics Calculations
                 if (data.equity_history && data.equity_history.length > 0) {
-                    let equities = data.equity_history.map(e => e.equity);
+                    let equities = data.equity_history.map(e => e.value);
                     let maxEquity = equities[0];
                     let maxDrawdown = 0;
                     

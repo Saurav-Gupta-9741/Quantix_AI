@@ -1,8 +1,8 @@
 import numpy as np
 
-class RLPortfolioManager:
+class KellyCriterionSizer:
     def __init__(self):
-        self.agent_name = "Quantix RL Manager"
+        self.agent_name = "Quantix Kelly Allocator"
         
     def get_position_size(self, signal, confidence_score, historical_returns=None):
         """
@@ -51,7 +51,7 @@ class RLPortfolioManager:
         return round(final_allocation * 100, 2)
 
 if __name__ == "__main__":
-    rl = RLPortfolioManager()
+    rl = KellyCriterionSizer()
     returns = np.random.normal(0.001, 0.02, 30)  # Simulated 30 days of returns
     size = rl.get_position_size("BUY", 0.75, returns)
-    print(f"Optimal RL Position Size: {size}%")
+    print(f"Optimal Kelly Position Size: {size}%")

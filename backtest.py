@@ -2,14 +2,14 @@ import torch
 import pandas as pd
 import numpy as np
 import os
-from sklearn.preprocessing import MinMaxScaler
 from lstm_model import TradingLSTM
+from position_sizer import KellyCriterionSizer
 
-def run_deep_learning_backtest(df, model_weights_path, initial_capital=100000, days_to_test=365):
+def run_deep_learning_backtest(df, model_weights_path, feature_scaler=None, target_scaler=None, initial_capital=100000, days_to_test=365):
     """
     Institutional-Grade Walk-Forward Backtester.
-    Uses PyTorch neural network if weights match, otherwise falls back to
-    REAL technical analysis strategy (RSI + MACD crossover).
+    Uses PyTorch neural network with passed scalers to avoid lookahead bias.
+    Includes transaction costs and symmetric thresholds.
     """
     # Ensure required columns exist
     required_cols = ['Close', 'Volume', 'RSI', 'MACD', 'MACD_Signal']
@@ -21,22 +21,21 @@ def run_deep_learning_backtest(df, model_weights_path, initial_capital=100000, d
     
     # Try loading neural network
     use_neural_net = False
-    if os.path.exists(model_weights_path):
+    if os.path.exists(model_weights_path) and feature_scaler is not None and target_scaler is not None:
         try:
             device = torch.device("cpu")
             model = TradingLSTM(input_size=5).to(device)
             model.load_state_dict(torch.load(model_weights_path, map_location=device))
             model.eval()
             
-            feature_scaler = MinMaxScaler(feature_range=(0, 1))
-            target_scaler = MinMaxScaler(feature_range=(0, 1))
+            # Use pre-fitted scalers (No lookahead bias)
             raw_features = df[required_cols].values
-            scaled_features = feature_scaler.fit_transform(raw_features)
-            scaled_targets = target_scaler.fit_transform(raw_targets)
+            scaled_features = feature_scaler.transform(raw_features)
+            
             use_neural_net = True
-            print("[+] Backtest: Neural network weights loaded successfully.")
-        except RuntimeError as e:
-            print(f"[-] Backtest: Weights mismatch ({e}). Using technical analysis strategy.")
+            print("[+] Backtest: Neural network weights and scalers loaded successfully.")
+        except Exception as e:
+            print(f"[-] Backtest: Neural net loading failed ({e}). Using technical analysis strategy.")
     
     # Setup Trading Simulation
     capital = initial_capital
@@ -46,6 +45,9 @@ def run_deep_learning_backtest(df, model_weights_path, initial_capital=100000, d
     losing_trades = 0
     equity_curve = []
     entry_price = 0
+    
+    TRANSACTION_FEE_PCT = 0.001  # 0.1% transaction cost
+    position_sizer = KellyCriterionSizer()
     
     max_possible_days = len(df) - 31
     if days_to_test > max_possible_days:
@@ -82,40 +84,58 @@ def run_deep_learning_backtest(df, model_weights_path, initial_capital=100000, d
             # Score-based signal generation
             score = 0.0
             
-            # RSI signals
-            if rsi < 30: score += 0.4      # Oversold = buy signal
+            if rsi < 30: score += 0.4
             elif rsi < 40: score += 0.2
-            elif rsi > 70: score -= 0.4    # Overbought = sell signal
+            elif rsi > 70: score -= 0.4
             elif rsi > 60: score -= 0.2
             
-            # MACD crossover
-            if macd > macd_signal: score += 0.3  # Bullish crossover
-            else: score -= 0.3                    # Bearish crossover
+            if macd > macd_signal: score += 0.3
+            else: score -= 0.3
             
-            # EMA trend
-            if ema_short > ema_long: score += 0.3  # Uptrend
-            else: score -= 0.3                      # Downtrend
+            if ema_short > ema_long: score += 0.3
+            else: score -= 0.3
             
-            expected_roi = score * 0.05  # Convert score to expected ROI
+            expected_roi = score * 0.05
         
-        # Trading Logic
-        if expected_roi > 0.01:  # Buy threshold
+        # Trading Logic - Symmetric Thresholds & Transaction Costs
+        # Only buy if expected ROI beats transaction cost significantly
+        if expected_roi > 0.01 + TRANSACTION_FEE_PCT:  
             if capital >= current_price:
-                shares_bought = capital // current_price
-                capital -= shares_bought * current_price
-                shares_held += shares_bought
-                entry_price = current_price
-                buy_signals += 1
+                # Proper position sizing via Kelly Criterion instead of all-in
+                historical_returns = df['Close'].pct_change().dropna().values[-30:]
+                size_pct = position_sizer.get_position_size("BUY", min(max(expected_roi * 10, 0.1), 0.99), historical_returns) / 100.0
                 
-        elif expected_roi < 0.00:  # Sell threshold
+                investment = capital * size_pct
+                if investment >= current_price:
+                    shares_to_buy = investment // current_price
+                    cost = shares_to_buy * current_price
+                    fee = cost * TRANSACTION_FEE_PCT
+                    
+                    capital -= (cost + fee)
+                    shares_held += shares_to_buy
+                    
+                    # Update average entry price
+                    if shares_held > 0:
+                        total_cost_basis = (entry_price * (shares_held - shares_to_buy)) + (cost + fee)
+                        entry_price = total_cost_basis / shares_held
+                    else:
+                        entry_price = current_price
+                        
+                    buy_signals += 1
+                
+        elif expected_roi < -0.01 - TRANSACTION_FEE_PCT:  # Sell threshold (symmetric)
             if shares_held > 0:
-                sell_revenue = shares_held * current_price
-                capital += sell_revenue
-                if current_price > entry_price:
+                revenue = shares_held * current_price
+                fee = revenue * TRANSACTION_FEE_PCT
+                net_revenue = revenue - fee
+                
+                capital += net_revenue
+                if net_revenue > (shares_held * entry_price):
                     winning_trades += 1
                 else:
                     losing_trades += 1
                 shares_held = 0
+                entry_price = 0
         
         # Record equity curve
         current_equity = capital + (shares_held * current_price)
@@ -124,7 +144,9 @@ def run_deep_learning_backtest(df, model_weights_path, initial_capital=100000, d
     
     # Close any remaining position
     if shares_held > 0:
-        capital += shares_held * float(raw_targets[-1][0])
+        revenue = shares_held * float(raw_targets[-1][0])
+        fee = revenue * TRANSACTION_FEE_PCT
+        capital += (revenue - fee)
         shares_held = 0
     
     # Analytics
@@ -146,8 +168,3 @@ def run_deep_learning_backtest(df, model_weights_path, initial_capital=100000, d
         "equity_curve": equity_curve,
         "strategy": "Neural Network" if use_neural_net else "Technical Analysis (RSI+MACD+EMA)"
     }
-
-if __name__ == "__main__":
-    df = pd.read_csv("bitcoin_processed_data.csv", index_col='Date', parse_dates=True)
-    res = run_deep_learning_backtest(df, "quantix_btc_lstm.pth", days_to_test=365)
-    print(res)

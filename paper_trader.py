@@ -1,45 +1,36 @@
 import os
 import time
-import requests
-import yfinance as yf
 from datetime import datetime
-from shared_state import get_conn, _db_lock, get_balance
-
-API_URL = "http://127.0.0.1:8000/api/analyze"
+from shared_state import db, _db_lock, get_balance
+# Import the analyze function directly to avoid self-referential HTTP calls
+from main_api import analyze
 
 def get_watchlist():
     watchlist = []
-    with _db_lock:
-        conn = get_conn()
+    with db.get_connection() as conn:
         cursor = conn.execute("SELECT ticker FROM watchlist")
         for row in cursor.fetchall():
             watchlist.append(row[0])
-        conn.close()
     return watchlist
 
 def get_holdings():
     holdings = set()
-    with _db_lock:
-        conn = get_conn()
+    with db.get_connection() as conn:
         cursor = conn.execute("SELECT ticker FROM holdings")
         for row in cursor.fetchall():
             holdings.add(row[0])
-        conn.close()
     return holdings
 
 def get_signals():
     signals = set()
-    with _db_lock:
-        conn = get_conn()
+    with db.get_connection() as conn:
         cursor = conn.execute("SELECT ticker FROM signals")
         for row in cursor.fetchall():
             signals.add(row[0])
-        conn.close()
     return signals
 
 def insert_signal(sig_obj):
-    with _db_lock:
-        conn = get_conn()
+    with db.get_connection() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO signals 
             (ticker, signal, confidence, predicted_roi, current_price, recommended_qty, cost, date) 
@@ -50,7 +41,6 @@ def insert_signal(sig_obj):
             sig_obj['recommended_qty'], sig_obj['cost'], sig_obj['date']
         ))
         conn.commit()
-        conn.close()
 
 def run_paper_trading_tick():
     print(f"\n[======== PAPER TRADING TICK - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ========]")
@@ -65,23 +55,19 @@ def run_paper_trading_tick():
     for ticker in watchlist:
         print(f"[*] Analyzing {ticker}...")
         try:
-            params = {
-                "ticker": ticker,
-                "asset_class": "Global_Cluster",
-                "sector": "all",
-                "market_cap": "10",
-                "pe_ratio": "50",
-                "volume": "1000000",
-                "beta": "any",
-                "timeframe": "swing",
-                "risk": "dynamic"
-            }
-            res = requests.get(API_URL, params=params, timeout=120)
-            if res.status_code != 200:
-                print(f"[-] API Error for {ticker}: {res.status_code}")
+            # Call Python function directly instead of making HTTP request to localhost
+            data = analyze(
+                ticker=ticker,
+                asset_class="Global_Cluster",
+                beta="any",
+                timeframe="swing",
+                risk="dynamic"
+            )
+            
+            if "error" in data:
+                print(f"[-] Analysis Error for {ticker}: {data['error']}")
                 continue
                 
-            data = res.json()
             signal = data['execution_suggestion']['signal']
             current_price = data['current_price']['usd']
             rl_size_str = data['execution_suggestion']['rl_position_size'].replace('%', '')
@@ -91,11 +77,23 @@ def run_paper_trading_tick():
                 allocate_amount = balance * rl_size
                 if allocate_amount > 100:
                     qty = allocate_amount / current_price
+                    
+                    # Fix confidence parsing to use consensus score
+                    confidence_val = data.get("ai_analysis", {}).get("consensus_score", "75")
+                    
+                    # Fix ROI parsing to be a percentage, not absolute price
+                    try:
+                        predicted_price = float(data.get("ai_analysis", {}).get("lstm_predicted_price", {}).get("usd", current_price))
+                        roi_pct = ((predicted_price - current_price) / current_price) * 100
+                        roi_str = f"{roi_pct:.2f}%"
+                    except Exception:
+                        roi_str = "0.0%"
+                        
                     sig_obj = {
                         "ticker": ticker,
                         "signal": "BUY",
-                        "confidence": data.get("strategy_summary", "").split("Confidence:")[0][-5:] if "Confidence" in data.get("strategy_summary", "") else "High",
-                        "predicted_roi": data.get("ai_analysis", {}).get("lstm_predicted_price", {}).get("usd", "0.0"),
+                        "confidence": f"{confidence_val}/100",
+                        "predicted_roi": roi_str,
                         "current_price": current_price,
                         "recommended_qty": qty,
                         "cost": allocate_amount,

@@ -1,86 +1,139 @@
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
-import uvicorn
-import asyncio
 import os
 import io
-import torch
-import numpy as np
-import yfinance as yf
-import pandas as pd
+import json
+import asyncio
+import urllib.parse
+from datetime import datetime
+from contextlib import contextmanager
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Depends, HTTPException, Header
+from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 import requests
 import joblib
-import mplfinance as mpf
-from matplotlib.backends.backend_agg import FigureCanvasAgg
+import subprocess
+import torch
+import numpy as np
+import pandas as pd
+import yfinance as yf
+from PIL import Image
+
 import matplotlib
 matplotlib.use('Agg')
-import threading
+import mplfinance as mpf
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+
 from transformers import pipeline
-import torch
-import torchvision.models as models
-from torchvision.transforms import functional as TF
-from io import BytesIO
-from contextlib import contextmanager
-from PIL import Image
 from torchvision import transforms
+
 from ticker_normalizer import TickerNormalizer
 from lstm_model import TradingLSTM
 from cnn_model import CandlestickCNN
 from news_sentiment_agent import NewsSentimentAgent
 from backtest import run_deep_learning_backtest
-from rl_agent import RLPortfolioManager
-from shared_state import init_db, get_conn, _db_lock, get_balance, update_balance
+from position_sizer import KellyCriterionSizer
+from shared_state import init_db, db, get_balance, update_balance
 from circuit_breaker import fetch_history, fetch_last_price
-import json
-from datetime import datetime
+from dotenv import load_dotenv
+
+load_dotenv()
+API_KEY = os.environ.get("QUANTIX_API_KEY", "dev_key_123")
+EXCHANGE_RATE_FALLBACK = float(os.environ.get("EXCHANGE_RATE_FALLBACK", 83.5))
+
+def verify_api_key(x_api_key: str = Header(None)):
+    if not x_api_key or x_api_key != API_KEY:
+        # For local dev without headers, we can be lenient, but strictly it should block.
+        # Since the UI might not send headers yet, we allow "dev_key_123" as fallback.
+        if API_KEY != "dev_key_123":
+            raise HTTPException(status_code=401, detail="Invalid API Key")
+    return x_api_key
 
 app = FastAPI(title="Quantix AI Terminal")
 
-# Setup SSE Event Queue
-signal_queue = asyncio.Queue()
+# CORS Middleware (Same origin + localhost for dev)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:8000", "http://127.0.0.1:8000"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def push_event(data_dict):
-    """Pushes event to the SSE stream."""
-    try:
-        asyncio.get_event_loop().call_soon_threadsafe(signal_queue.put_nowait, data_dict)
-    except:
-        pass
+# Per-client SSE state mapping client_id -> {"queue": Queue, "ticker": str}
+clients = {}
+
+def push_event(data_dict, target_ticker=None):
+    """
+    Pushes event to SSE clients. 
+    If target_ticker is set, only pushes to clients subscribed to that ticker.
+    Otherwise, broadcasts to all clients (e.g. for global 'refresh' events).
+    """
+    loop = asyncio.get_running_loop()
+    for cid, client_data in list(clients.items()):
+        if target_ticker and client_data.get("ticker") != target_ticker:
+            continue
+        try:
+            loop.call_soon_threadsafe(client_data["queue"].put_nowait, data_dict)
+        except Exception:
+            pass
+
+async def price_poller():
+    while True:
+        # Get unique tickers currently subscribed across all active clients
+        active_tickers = set(c["ticker"] for c in clients.values() if c.get("ticker"))
+        for ticker in active_tickers:
+            try:
+                clean = normalizer.normalize(ticker)
+                live_price = fetch_last_price(yf.Ticker(clean))
+                # Push ONLY to clients subscribed to this ticker
+                push_event({"type": "price_tick", "ticker": ticker, "price": live_price}, target_ticker=ticker)
+            except Exception:
+                pass
+        await asyncio.sleep(5.0)
 
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
     init_db()
-    import threading
-    def run_risk():
-        import subprocess
-        script_path = os.path.join(os.path.dirname(__file__), "risk_manager.py")
-        subprocess.run(["python", script_path])
-    
-    t = threading.Thread(target=run_risk, daemon=True)
-    t.start()
+    # F1 Fix: Use Popen so it runs in background without blocking
+    script_path = os.path.join(os.path.dirname(__file__), "risk_manager.py")
+    subprocess.Popen(["python", script_path])
     print("[+] QUANTIX: Auto-Take-Profit Risk Manager started in background.")
+    asyncio.create_task(price_poller())
 
 normalizer = TickerNormalizer()
 finbert = pipeline("sentiment-analysis", model="ProsusAI/finbert")
 news_agent = NewsSentimentAgent(finbert_analyzer=finbert)
-rl_manager = RLPortfolioManager()
+rl_manager = KellyCriterionSizer()
 
-# Global Model Registry (F2 Fix)
+# F1 Fix: Load scalers at startup
+try:
+    feature_scaler = joblib.load(os.path.join(os.path.dirname(__file__), "feature_scaler.pkl"))
+    target_scaler = joblib.load(os.path.join(os.path.dirname(__file__), "target_scaler.pkl"))
+    print("[+] Scalers loaded successfully.")
+except Exception as e:
+    print(f"[-] Failed to load scalers: {e}")
+    feature_scaler, target_scaler = None, None
+
 class ModelRegistry:
     def __init__(self, finbert):
         self._models = {}
         self.finbert = finbert
         
-    def register(self, name, model, weights_path, device):
+    def register(self, name, model, weights_path, device, freeze=True):
         if os.path.exists(weights_path):
             try:
                 model.load_state_dict(torch.load(weights_path, map_location=device))
                 model.eval()
-                for param in model.parameters():
-                    param.requires_grad_(False)
+                if freeze:
+                    for param in model.parameters():
+                        param.requires_grad_(False)
                 self._models[name] = model
-                print(f"[+] QUANTIX: {name} Loaded & Frozen.")
+                status = "Frozen" if freeze else "Trainable"
+                print(f"[+] QUANTIX: {name} Loaded & {status}.")
             except Exception as e:
-                print(f"[-] QUANTIX: {name} Weights mismatch.")
+                # F2 Fix: Explictly raise error instead of silent catch
+                raise RuntimeError(f"Weights mismatch for {name}: {e}")
         else:
             print(f"[-] QUANTIX: {name} weights not found.")
 
@@ -91,13 +144,19 @@ class ModelRegistry:
     def infer(self, name):
         with torch.inference_mode():
             yield self._models[name]
+            
+    @contextmanager
+    def infer_with_grad(self, name):
+        with torch.enable_grad():
+            yield self._models[name]
 
 registry = ModelRegistry(finbert)
 device = torch.device("cpu")
 
 registry.register("btc_lstm", TradingLSTM(input_size=5).to(device), os.path.join(os.path.dirname(__file__), "quantix_btc_lstm.pth"), device)
 registry.register("nifty_lstm", TradingLSTM(input_size=5).to(device), os.path.join(os.path.dirname(__file__), "quantix_nifty_lstm.pth"), device)
-registry.register("cnn", CandlestickCNN(num_classes=3).to(device), os.path.join(os.path.dirname(__file__), "quantix_cnn_v1.pth"), device)
+# F5 Fix: CNN must not be frozen so Grad-CAM backward pass works
+registry.register("cnn", CandlestickCNN(num_classes=5).to(device), os.path.join(os.path.dirname(__file__), "quantix_cnn_v1.pth"), device, freeze=False)
 
 cnn_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -120,11 +179,8 @@ def calculate_technical_indicators(df):
     df.bfill(inplace=True)
     return df
 
-# F3 Fix: Model Drift / Staleness Detection
 def check_model_drift(ticker, model, live_data, device):
-    """Computes RMSE of predictions over the last 15 days vs actuals."""
     try:
-        from sklearn.preprocessing import MinMaxScaler
         closes = live_data['Close'].values
         if len(closes) < 45: return False
         
@@ -136,12 +192,12 @@ def check_model_drift(ticker, model, live_data, device):
             if len(window_df) < 30: continue
             
             recent_30 = window_df[['Close', 'Volume', 'RSI', 'MACD', 'MACD_Signal']].values
-            feature_scaler = MinMaxScaler(feature_range=(0, 1))
-            recent_30_scaled = feature_scaler.fit_transform(recent_30)
-            seq_tensor = torch.tensor(np.array([recent_30_scaled]), dtype=torch.float32).to(device)
             
-            target_scaler = MinMaxScaler(feature_range=(0, 1))
-            target_scaler.fit(window_df[['Close']].values)
+            if feature_scaler is None or target_scaler is None:
+                return False
+                
+            recent_30_scaled = feature_scaler.transform(recent_30)
+            seq_tensor = torch.tensor(np.array([recent_30_scaled]), dtype=torch.float32).to(device)
             
             with torch.inference_mode():
                 raw_pred = model(seq_tensor).numpy()
@@ -149,7 +205,6 @@ def check_model_drift(ticker, model, live_data, device):
             preds.append(unscaled_pred)
             
         if len(preds) < 15: return False
-        
         rmse = np.sqrt(np.mean((np.array(preds) - test_actuals)**2)) / np.mean(test_actuals)
         if rmse > 0.05: 
             print(f"[!] MODEL DRIFT DETECTED on {ticker}: RMSE {rmse:.4f}")
@@ -157,6 +212,42 @@ def check_model_drift(ticker, model, live_data, device):
         return False
     except Exception as e:
         return False
+
+# F11 Fix: Exchange Rate API
+exchange_rate_cache = {"rate": EXCHANGE_RATE_FALLBACK, "timestamp": 0}
+def get_exchange_rate():
+    now = datetime.now().timestamp()
+    if now - exchange_rate_cache["timestamp"] > 3600:
+        try:
+            res = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=5)
+            rate = res.json()["rates"]["INR"]
+            exchange_rate_cache["rate"] = rate
+            exchange_rate_cache["timestamp"] = now
+        except Exception:
+            pass
+    return exchange_rate_cache["rate"]
+
+@app.get("/api/health")
+def health_check():
+    import time as _time
+    t0 = _time.perf_counter()
+    try:
+        with db.get_connection() as conn:
+            conn.execute("SELECT 1")
+        db_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
+    except Exception:
+        db_latency_ms = -1
+    return {
+        "status": "ONLINE",
+        "latency": f"{db_latency_ms}ms",
+        "cluster": "QUANTIX-LOCAL",
+        "models": {
+            "btc_lstm": registry.has("btc_lstm"),
+            "nifty_lstm": registry.has("nifty_lstm"),
+            "cnn": registry.has("cnn")
+        },
+        "scalers_loaded": feature_scaler is not None
+    }
 
 @app.get("/", response_class=HTMLResponse)
 def read_root():
@@ -168,9 +259,11 @@ def read_root():
 def search_ticker(q: str):
     if not q: return []
     try:
-        url = f"https://symbol-search.tradingview.com/symbol_search/?text={q}&hl=1&exchange=&lang=en&type=&domain=production"
+        # F7 Fix: SSRF Prevention via URL encoding
+        safe_q = urllib.parse.quote(q)
+        url = f"https://symbol-search.tradingview.com/symbol_search/?text={safe_q}&hl=1&exchange=&lang=en&type=&domain=production"
         headers = {'Origin': 'https://www.tradingview.com', 'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers)
+        response = requests.get(url, headers=headers, timeout=5)
         data = response.json()
         results = []
         for item in data[:8]:
@@ -195,7 +288,7 @@ def search_ticker(q: str):
         return []
 
 @app.get("/api/analyze")
-def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str):
+def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str, token: str = Depends(verify_api_key)):
     print(f"\n[>>>] INCOMING QUERY: {ticker}")
     clean_ticker = normalizer.normalize(ticker)
     
@@ -207,7 +300,6 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
     if live_data.empty:
         return {"error": f"No market data found for {clean_ticker}."}
 
-    # F1 Fix: Data Recency Check
     last_date = live_data.index[-1].tz_localize(None)
     if (datetime.now() - last_date).days > 5:
         return {"error": f"Stale data for {clean_ticker}. Ticker may be halted or delisted."}
@@ -215,26 +307,29 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
     live_data = calculate_technical_indicators(live_data)
     current_price = live_data['Close'].iloc[-1].item()
     
-    recent_30 = live_data[['Close', 'Volume', 'RSI', 'MACD', 'MACD_Signal']].tail(30).values
-    from sklearn.preprocessing import MinMaxScaler
-    feature_scaler = MinMaxScaler(feature_range=(0, 1))
-    recent_30_scaled = feature_scaler.fit_transform(recent_30)
-    seq_tensor = torch.tensor(np.array([recent_30_scaled]), dtype=torch.float32).to(device)
-    
-    exchange_rate = 83.5
+    exchange_rate = get_exchange_rate()
     is_inr_native = "NS" in clean_ticker.upper() or "BO" in clean_ticker.upper()
     price_inr = float(current_price) if is_inr_native else float(current_price * exchange_rate)
     price_usd = float(current_price / exchange_rate) if is_inr_native else float(current_price)
     
     lstm_name = "nifty_lstm" if is_inr_native else "btc_lstm"
     
-    if registry.has(lstm_name):
-        is_drifting = False
+    prediction_method = ""
+    is_drifting = False
+    
+    is_fallback_mode = False
+    
+    if registry.has(lstm_name) and feature_scaler is not None and target_scaler is not None:
+        model = registry._models[lstm_name]
+        is_drifting = check_model_drift(clean_ticker, model, live_data, device)
+        if is_drifting:
+            is_fallback_mode = True
+        
+        recent_30 = live_data[['Close', 'Volume', 'RSI', 'MACD', 'MACD_Signal']].tail(30).values
+        recent_30_scaled = feature_scaler.transform(recent_30)
+        seq_tensor = torch.tensor(np.array([recent_30_scaled]), dtype=torch.float32).to(device)
+        
         with registry.infer(lstm_name) as model:
-            is_drifting = check_model_drift(clean_ticker, model, live_data, device)
-            
-            target_scaler = MinMaxScaler(feature_range=(0, 1))
-            target_scaler.fit(live_data[['Close']].tail(30).values)
             raw_prediction = model(seq_tensor).numpy()
             unscaled_pred = target_scaler.inverse_transform(raw_prediction)
             
@@ -247,12 +342,12 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
             
         prediction_method = "Neural Network (BiLSTM+Attention)"
         
-        # Override if drifting
         if is_drifting:
             predicted_price_usd = price_usd
             predicted_price_inr = price_inr
             prediction_method += " [SUPPRESSED DUE TO DRIFT]"
     else:
+        is_fallback_mode = True
         rsi = float(live_data['RSI'].iloc[-1])
         macd = float(live_data['MACD'].iloc[-1])
         macd_signal = float(live_data['MACD_Signal'].iloc[-1])
@@ -273,15 +368,15 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
         else: ta_score -= 0.3
         
         predicted_price_usd = price_usd * (1 + ta_score * 0.05)
+        predicted_price_inr = predicted_price_usd * exchange_rate
         prediction_method = f"Technical Analysis (RSI={rsi:.1f}, MACD={'Bullish' if macd > macd_signal else 'Bearish'}, EMA={'Up' if ema_9 > ema_21 else 'Down'})"
     
     lstm_signal = "BULLISH" if predicted_price_usd > price_usd else ("BEARISH" if predicted_price_usd < price_usd else "HOLD")
-    predicted_price_inr = float(predicted_price_usd * exchange_rate)
     
     pattern_map = {0: "Bull Flag", 1: "Bear Flag", 2: "Consolidation", 3: "Head & Shoulders", 4: "Double Bottom"}
+    gradcam_b64 = None
     
     if registry.has("cnn"):
-        # F1 Fix: Thread-safe Matplotlib via Agg Buffer
         mc = mpf.make_marketcolors(up='g', down='r', inherit=True)
         s = mpf.make_mpf_style(marketcolors=mc)
         fig, axes = mpf.plot(live_data.tail(30), type='candle', style=s, volume=False, returnfig=True)
@@ -291,14 +386,33 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
         buf.seek(0)
         
         import matplotlib.pyplot as plt
-        plt.close(fig) # Prevent memory leaks
+        plt.close(fig)
         
         img = Image.open(buf).convert("RGB")
         img_tensor = cnn_transform(img).unsqueeze(0).to(device)
         
-        with registry.infer("cnn") as model:
+        with registry.infer_with_grad("cnn") as model:
             cnn_outputs = model(img_tensor)
             _, predicted_class = torch.max(cnn_outputs, 1)
+            
+            # Extract Grad-CAM if available
+            if hasattr(model, 'get_gradcam_heatmap'):
+                model.zero_grad()
+                # Run backward pass for the predicted class to populate self.gradients via hook
+                cnn_outputs[0, predicted_class.item()].backward()
+                
+                cam = model.get_gradcam_heatmap()
+                if cam is not None:
+                    import cv2
+                    import base64
+                    heatmap = cv2.applyColorMap(np.uint8(255 * cam), cv2.COLORMAP_JET)
+                    # Overlay heatmap on original image
+                    orig_cv2 = np.array(img)
+                    orig_cv2 = cv2.cvtColor(orig_cv2, cv2.COLOR_RGB2BGR)
+                    orig_cv2 = cv2.resize(orig_cv2, (224, 224))
+                    overlay = cv2.addWeighted(orig_cv2, 0.6, heatmap, 0.4, 0)
+                    _, buffer = cv2.imencode('.png', overlay)
+                    gradcam_b64 = base64.b64encode(buffer).decode('utf-8')
         
         detected_pattern = pattern_map[predicted_class.item()]
     else:
@@ -319,9 +433,6 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
     
     cnn_signal = "BULLISH" if ("Bull" in detected_pattern or "Bottom" in detected_pattern) else ("BEARISH" if ("Bear" in detected_pattern or "Head" in detected_pattern) else "NEUTRAL")
     
-    start_day = 15; end_day = 20 
-    
-    # 3. News Sentiment NLP
     try:
         finbert_signal, finbert_summary = news_agent.analyze_fundamentals(clean_ticker)
     except Exception as e:
@@ -360,19 +471,26 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
             if min_len > 5:
                 cov = np.cov(asset_returns.values[-min_len:], market_returns.values[-min_len:])
                 real_beta = str(round(float(cov[0][1] / cov[1][1]), 2))
-    except:
+    except Exception:
         pass
     
+    # F4 Fix: Ensure API contract names match frontend
     return {
         "asset": clean_ticker,
         "current_price": {"usd": round(price_usd, 2), "inr": round(price_inr, 2)},
         "filtered_data": {"asset_class": asset_class.replace('_', ' '), "beta_simulated": real_beta},
         "ai_analysis": {
             "lstm_predicted_price": {"usd": round(predicted_price_usd, 2), "inr": round(predicted_price_inr, 2)},
-            "cnn_pattern": detected_pattern,
+            "cnn_visual_pattern": detected_pattern,
+            "finbert_sentiment": finbert_signal,
             "llm_advisor_summary": finbert_summary,
-            "whale_manipulation_risk": "HIGH" if whale_detected else "LOW",
-            "score_breakdown": score_breakdown
+            "whale_manipulation_detected": whale_detected,
+            "score_breakdown": score_breakdown,
+            "lstm_signal": lstm_signal,
+            "cnn_signal": cnn_signal,
+            "finbert_signal": finbert_signal,
+            "is_fallback_mode": is_fallback_mode,
+            "consensus_score": round(score * 100, 2)
         },
         "strategy_summary": (
             f"Based on a consensus score of {score:.2f}, the system recommends a {action}. "
@@ -387,11 +505,12 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str)
                 "inr": round(price_inr * (0.97 if action == 'BUY' else 1.03), 2)
             }
         },
-        "prediction_method": prediction_method
+        "prediction_method": prediction_method,
+        "gradcam_base64": gradcam_b64
     }
 
 @app.get("/api/backtest")
-def backtest_ticker(ticker: str):
+def backtest_ticker(ticker: str, token: str = Depends(verify_api_key)):
     clean_ticker = normalizer.normalize(ticker)
     try:
         df = fetch_history(yf.Ticker(clean_ticker), period="1y", interval="1d")
@@ -399,18 +518,26 @@ def backtest_ticker(ticker: str):
         df = calculate_technical_indicators(df)
         is_inr_native = "NS" in clean_ticker.upper() or "BO" in clean_ticker.upper()
         model_path = os.path.join(os.path.dirname(__file__), "quantix_nifty_lstm.pth") if is_inr_native else os.path.join(os.path.dirname(__file__), "quantix_btc_lstm.pth")
-        res = run_deep_learning_backtest(df, model_weights_path=model_path, days_to_test=365)
+        res = run_deep_learning_backtest(df, model_weights_path=model_path, feature_scaler=feature_scaler, target_scaler=target_scaler, days_to_test=365)
         return res
     except Exception as e:
         return {"error": str(e)}
 
-# F4 Fix: SSE Stream
 @app.get("/api/stream")
-async def event_stream():
+async def event_stream(request: Request, client_id: str = "default"):
+    queue = asyncio.Queue()
+    clients[client_id] = {"queue": queue, "ticker": None}
+    
     async def generate():
-        while True:
-            event = await signal_queue.get()
-            yield f"data: {json.dumps(event)}\n\n"
+        try:
+            while True:
+                # Check if client disconnected
+                if await request.is_disconnected():
+                    break
+                event = await queue.get()
+                yield f"data: {json.dumps(event)}\n\n"
+        finally:
+            clients.pop(client_id, None)
     return StreamingResponse(generate(), media_type="text/event-stream")
 
 @app.post("/api/trigger_refresh")
@@ -419,28 +546,25 @@ def trigger_refresh():
     return {"status": "success"}
 
 @app.get("/api/portfolio")
-def get_portfolio():
-    with _db_lock:
-        conn = get_conn()
+def get_portfolio(token: str = Depends(verify_api_key)):
+    with db.get_connection() as conn:
         balance = get_balance()
         holdings = {}
-        cursor = conn.execute("SELECT * FROM holdings")
+        cursor = conn.execute("SELECT ticker, qty, entry_price, total_cost, date, currency, stop_loss_pct, take_profit_pct FROM holdings")
         for row in cursor.fetchall():
-            ticker, qty, entry_price, total_cost, date = row
+            ticker, qty, entry_price, total_cost, date, currency, sl_pct, tp_pct = row
             try:
                 live_price = fetch_last_price(yf.Ticker(ticker))
-                if "NS" in ticker.upper() or "BO" in ticker.upper():
-                    live_price = live_price / 83.5
                 unrealized_pnl = (live_price - entry_price) * qty
                 pnl_pct = ((live_price - entry_price) / entry_price) * 100
                 holdings[ticker] = {
                     "qty": qty, "entry_price": entry_price, "total_cost": total_cost, "date": date,
-                    "live_price": live_price, "unrealized_pnl": unrealized_pnl, "pnl_pct": pnl_pct
+                    "live_price": live_price, "unrealized_pnl": unrealized_pnl, "pnl_pct": pnl_pct, "currency": currency
                 }
-            except:
+            except Exception:
                 holdings[ticker] = {
                     "qty": qty, "entry_price": entry_price, "total_cost": total_cost, "date": date,
-                    "live_price": entry_price, "unrealized_pnl": 0.0, "pnl_pct": 0.0
+                    "live_price": entry_price, "unrealized_pnl": 0.0, "pnl_pct": 0.0, "currency": currency
                 }
                 
         trade_history = []
@@ -448,11 +572,15 @@ def get_portfolio():
         for row in cursor.fetchall():
             trade_history.append(row[0])
             
-        conn.close()
-    return {"balance_usd": balance, "holdings": holdings, "trade_history": trade_history}
+        equity_history = []
+        cursor = conn.execute("SELECT timestamp, total_equity FROM equity_snapshots ORDER BY id ASC")
+        for row in cursor.fetchall():
+            equity_history.append({"time": row[0], "value": row[1]})
+            
+    return {"balance_usd": balance, "holdings": holdings, "trade_history": trade_history, "equity_history": equity_history}
 
 @app.post("/api/portfolio/run")
-async def run_portfolio_tick():
+async def run_portfolio_tick(token: str = Depends(verify_api_key)):
     import asyncio
     script_path = os.path.join(os.path.dirname(__file__), "paper_trader.py")
     process = await asyncio.create_subprocess_exec("python", script_path)
@@ -461,9 +589,8 @@ async def run_portfolio_tick():
     return {"status": "Paper trading sweep completed. Signals generated."}
 
 @app.get("/api/signals")
-def get_signals():
-    with _db_lock:
-        conn = get_conn()
+def get_signals(token: str = Depends(verify_api_key)):
+    with db.get_connection() as conn:
         signals = []
         cursor = conn.execute("SELECT * FROM signals")
         for row in cursor.fetchall():
@@ -472,20 +599,17 @@ def get_signals():
                 "predicted_roi": row[3], "current_price": row[4], "recommended_qty": row[5],
                 "cost": row[6], "date": row[7]
             })
-        conn.close()
     return signals
 
 @app.post("/api/execute_trade")
-async def execute_trade(request: Request):
+async def execute_trade(request: Request, token: str = Depends(verify_api_key)):
     data = await request.json()
     ticker = data.get("ticker")
     
-    with _db_lock:
-        conn = get_conn()
+    with db.get_connection() as conn:
         cursor = conn.execute("SELECT * FROM signals WHERE ticker=?", (ticker,))
         sig = cursor.fetchone()
         if not sig:
-            conn.close()
             return {"error": "Signal not found."}
             
         ticker, signal, conf, roi, current_price, qty, cost, date = sig
@@ -493,36 +617,57 @@ async def execute_trade(request: Request):
         
         if balance >= cost:
             update_balance(balance - cost)
-            conn.execute("INSERT OR REPLACE INTO holdings (ticker, qty, entry_price, total_cost, date) VALUES (?, ?, ?, ?, ?)",
-                         (ticker, qty, current_price, cost, datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            currency = "INR" if ("NS" in ticker.upper() or "BO" in ticker.upper()) else "USD"
+            conn.execute("INSERT OR REPLACE INTO holdings (ticker, qty, entry_price, total_cost, date, currency) VALUES (?, ?, ?, ?, ?, ?)",
+                         (ticker, qty, current_price, cost, datetime.now().strftime('%Y-%m-%d %H:%M:%S'), currency))
             conn.execute("DELETE FROM signals WHERE ticker=?", (ticker,))
             conn.execute("INSERT INTO trade_history (log_msg, date) VALUES (?, ?)", 
-                         (f"BUY {ticker}: {qty:.4f} shares @ ${current_price:.2f}", datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+                         (f"BUY {ticker}: {qty:.4f} shares @ ${current_price:.2f} ({currency})", datetime.now().strftime('%Y-%m-%d %H:%M:%S')))
+            
+            # Record Equity Snapshot
+            new_equity = balance - cost + (qty * current_price) # naive for now
+            conn.execute("INSERT INTO equity_snapshots (timestamp, total_equity) VALUES (?, ?)", 
+                         (datetime.now().strftime('%Y-%m-%d %H:%M:%S'), new_equity))
+                         
             conn.commit()
-            conn.close()
             push_event({"type": "refresh"})
             return {"status": "success"}
         else:
-            conn.close()
             return {"error": "Insufficient funds to execute trade."}
 
-@app.websocket('/ws/live_prices/{ticker}')
-async def websocket_endpoint(websocket: WebSocket, ticker: str):
-    await websocket.accept()
-    clean_ticker = normalizer.normalize(ticker)
-    try:
-        ticker_obj = yf.Ticker(clean_ticker)
-        base_price = fetch_last_price(ticker_obj)
-    except:
-        base_price = 1000.0
+# F5 Fix: Watchlist Endpoints
+@app.get("/api/watchlist")
+def get_watchlist():
+    with db.get_connection() as conn:
+        cursor = conn.execute("SELECT ticker FROM watchlist")
+        return [row[0] for row in cursor.fetchall()]
 
-    try:
-        while True:
-            try:
-                live_price = fetch_last_price(yf.Ticker(clean_ticker))
-            except:
-                live_price = base_price
-            await websocket.send_json({'ticker': ticker, 'live_price': round(live_price, 2)})
-            await asyncio.sleep(5.0)
-    except WebSocketDisconnect:
-        pass
+@app.post("/api/watchlist")
+async def add_watchlist(request: Request, token: str = Depends(verify_api_key)):
+    data = await request.json()
+    ticker = data.get("ticker")
+    if not ticker: return {"error": "Ticker required"}
+    with db.get_connection() as conn:
+        conn.execute("INSERT OR IGNORE INTO watchlist (ticker) VALUES (?)", (ticker,))
+        conn.commit()
+    push_event({"type": "refresh"})
+    return {"status": "success"}
+
+@app.delete("/api/watchlist/{ticker}")
+def remove_watchlist(ticker: str, token: str = Depends(verify_api_key)):
+    with db.get_connection() as conn:
+        conn.execute("DELETE FROM watchlist WHERE ticker=?", (ticker,))
+        conn.commit()
+    push_event({"type": "refresh"})
+    return {"status": "success"}
+
+@app.post("/api/subscribe_price")
+async def subscribe_price(request: Request, token: str = Depends(verify_api_key)):
+    data = await request.json()
+    ticker = data.get("ticker")
+    client_id = data.get("client_id", "default")
+    
+    if client_id in clients:
+        clients[client_id]["ticker"] = ticker
+        
+    return {"status": "subscribed"}
