@@ -7,7 +7,7 @@ from main_api import analyze
 
 def get_watchlist():
     watchlist = []
-    with db.get_connection() as conn:
+    with db.get_write_connection() as conn:
         cursor = conn.execute("SELECT ticker FROM watchlist")
         for row in cursor.fetchall():
             watchlist.append(row[0])
@@ -15,7 +15,7 @@ def get_watchlist():
 
 def get_holdings():
     holdings = set()
-    with db.get_connection() as conn:
+    with db.get_write_connection() as conn:
         cursor = conn.execute("SELECT ticker FROM holdings")
         for row in cursor.fetchall():
             holdings.add(row[0])
@@ -23,14 +23,14 @@ def get_holdings():
 
 def get_signals():
     signals = set()
-    with db.get_connection() as conn:
+    with db.get_write_connection() as conn:
         cursor = conn.execute("SELECT ticker FROM signals")
         for row in cursor.fetchall():
             signals.add(row[0])
     return signals
 
 def insert_signal(sig_obj):
-    with db.get_connection() as conn:
+    with db.get_write_connection() as conn:
         conn.execute("""
             INSERT OR REPLACE INTO signals 
             (ticker, signal, confidence, predicted_roi, current_price, recommended_qty, cost, date) 
@@ -55,14 +55,15 @@ def run_paper_trading_tick():
     for ticker in watchlist:
         print(f"[*] Analyzing {ticker}...")
         try:
-            # Call Python function directly instead of making HTTP request to localhost
-            data = analyze(
+            # Flaw 32 Fix: Await the async analyze function
+            import asyncio
+            data = asyncio.run(analyze(
                 ticker=ticker,
                 asset_class="Global_Cluster",
                 beta="any",
                 timeframe="swing",
                 risk="dynamic"
-            )
+            ))
             
             if "error" in data:
                 print(f"[-] Analysis Error for {ticker}: {data['error']}")

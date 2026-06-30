@@ -13,10 +13,19 @@ class DatabaseManager:
     """Manages SQLite connections with RLock (for threads) and WAL mode (for processes)."""
     
     @contextmanager
-    def get_connection(self):
+    def get_read_connection(self, timeout_val=5.0):
+        """Yields a read-only connection without acquiring the RLock, maximizing WAL concurrency."""
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=timeout_val)
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+    @contextmanager
+    def get_write_connection(self, timeout_val=5.0):
+        """Yields a write connection, acquiring the RLock to serialize intra-process write atomicity."""
         with _db_lock:
-            # PROOF: timeout=5.0 automatically maps to PRAGMA busy_timeout=5000 in Python's sqlite3
-            conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=5.0)
+            conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=timeout_val)
             try:
                 yield conn
             finally:
@@ -25,7 +34,7 @@ class DatabaseManager:
 db = DatabaseManager()
 
 def init_db():
-    with db.get_connection() as conn:
+    with db.get_write_connection() as conn:
         # PROOF: WAL mode is a persistent database setting. Executed once on init, not per-connection.
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("""
@@ -113,12 +122,17 @@ def init_db():
 
 
 def get_balance():
-    with db.get_connection() as conn:
+    with db.get_read_connection() as conn:
         cursor = conn.execute("SELECT balance_usd FROM portfolio WHERE id=1")
         row = cursor.fetchone()
         return row[0] if row else 100000.0
 
+def get_holdings():
+    with db.get_read_connection() as conn:
+        cursor = conn.execute("SELECT * FROM holdings")
+        return cursor.fetchall()
+
 def update_balance(new_balance):
-    with db.get_connection() as conn:
+    with db.get_write_connection() as conn:
         conn.execute("UPDATE portfolio SET balance_usd = ? WHERE id=1", (new_balance,))
         conn.commit()

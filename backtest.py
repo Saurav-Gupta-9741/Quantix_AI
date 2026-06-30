@@ -103,8 +103,23 @@ def run_deep_learning_backtest(df, model_weights_path, feature_scaler=None, targ
             if capital >= current_price:
                 # Proper position sizing via Kelly Criterion instead of all-in
                 historical_returns = df['Close'].pct_change().dropna().values[-30:]
-                size_pct = position_sizer.get_position_size("BUY", min(max(expected_roi * 10, 0.1), 0.99), historical_returns) / 100.0
                 
+                # FIX 23: Calculate real rolling win rate instead of fabricated constant
+                total_closed = winning_trades + losing_trades
+                if total_closed >= 5:
+                    rolling_win_rate = winning_trades / total_closed
+                else:
+                    rolling_win_rate = 0.51 # Conservative default until empirical data builds up
+                    
+                # FIX 23: Fix mismatched signature by explicitly passing take_profit and stop_loss
+                size_pct = position_sizer.get_position_size(
+                    signal="BUY",
+                    historical_win_rate=rolling_win_rate,
+                    take_profit_pct=0.05,
+                    stop_loss_pct=-0.03,
+                    historical_returns=historical_returns,
+                    target_volatility=0.20
+                ) / 100.0
                 investment = capital * size_pct
                 if investment >= current_price:
                     shares_to_buy = investment // current_price

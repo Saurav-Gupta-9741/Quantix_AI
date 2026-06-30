@@ -28,7 +28,7 @@ def run_risk_manager():
         try:
             sold_something = False
             
-            with db.get_connection() as conn:
+            with db.get_write_connection() as conn:
                 cursor = conn.execute("SELECT ticker, qty, entry_price, total_cost, date, currency, stop_loss_pct, take_profit_pct FROM holdings")
                 holdings = cursor.fetchall()
                 
@@ -61,7 +61,7 @@ def run_risk_manager():
                         if currency == 'INR':
                             usd_revenue = revenue / get_exchange_rate()
                         
-                        with db.get_connection() as conn:
+                        with db.get_write_connection() as conn:
                             # PROOF: Explicit transaction and rowcount check to prevent silent no-ops against stale data
                             conn.execute("BEGIN IMMEDIATE")
                             cursor = conn.execute("DELETE FROM holdings WHERE ticker=?", (ticker,))

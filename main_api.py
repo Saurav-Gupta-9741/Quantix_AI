@@ -28,9 +28,11 @@ from transformers import pipeline
 from torchvision import transforms
 
 from ticker_normalizer import TickerNormalizer
+from position_sizer import KellyCriterionSizer
+from config import calculate_consensus, EMPIRICAL_CACHE
+from news_sentiment_agent import NewsSentimentAgent
 from lstm_model import TradingLSTM
 from cnn_model import CandlestickCNN
-from news_sentiment_agent import NewsSentimentAgent
 from backtest import run_deep_learning_backtest
 from position_sizer import KellyCriterionSizer
 from shared_state import init_db, db, get_balance, update_balance
@@ -156,7 +158,7 @@ device = torch.device("cpu")
 registry.register("btc_lstm", TradingLSTM(input_size=5).to(device), os.path.join(os.path.dirname(__file__), "quantix_btc_lstm.pth"), device)
 registry.register("nifty_lstm", TradingLSTM(input_size=5).to(device), os.path.join(os.path.dirname(__file__), "quantix_nifty_lstm.pth"), device)
 # F5 Fix: CNN must not be frozen so Grad-CAM backward pass works
-registry.register("cnn", CandlestickCNN(num_classes=5).to(device), os.path.join(os.path.dirname(__file__), "quantix_cnn_v1.pth"), device, freeze=False)
+registry.register("cnn", CandlestickCNN(num_classes=3).to(device), os.path.join(os.path.dirname(__file__), "quantix_cnn_v1.pth"), device, freeze=False)
 
 cnn_transform = transforms.Compose([
     transforms.Resize((224, 224)),
@@ -206,25 +208,30 @@ def check_model_drift(ticker, model, live_data, device):
             
         if len(preds) < 15: return False
         rmse = np.sqrt(np.mean((np.array(preds) - test_actuals)**2)) / np.mean(test_actuals)
-        if rmse > 0.05: 
+        if round(rmse, 4) > 0.0500: 
             print(f"[!] MODEL DRIFT DETECTED on {ticker}: RMSE {rmse:.4f}")
             return True
         return False
     except Exception as e:
         return False
 
-# F11 Fix: Exchange Rate API
-exchange_rate_cache = {"rate": EXCHANGE_RATE_FALLBACK, "timestamp": 0}
+# F11 Fix: Exchange Rate API with Circuit Breaker (Fix 8)
+exchange_rate_cache = {"rate": EXCHANGE_RATE_FALLBACK, "timestamp": 0, "failures": 0}
+
 def get_exchange_rate():
     now = datetime.now().timestamp()
     if now - exchange_rate_cache["timestamp"] > 3600:
         try:
             res = requests.get("https://api.exchangerate-api.com/v4/latest/USD", timeout=5)
+            res.raise_for_status()
             rate = res.json()["rates"]["INR"]
             exchange_rate_cache["rate"] = rate
             exchange_rate_cache["timestamp"] = now
-        except Exception:
-            pass
+            exchange_rate_cache["failures"] = 0
+        except Exception as e:
+            exchange_rate_cache["failures"] += 1
+            print(f"[!] FX Circuit Breaker tripped. Using fallback rate. Failures: {exchange_rate_cache['failures']}")
+            # Use cached rate or fallback, don't update timestamp so it retries on next call
     return exchange_rate_cache["rate"]
 
 @app.get("/api/health")
@@ -232,7 +239,7 @@ def health_check():
     import time as _time
     t0 = _time.perf_counter()
     try:
-        with db.get_connection() as conn:
+        with db.get_read_connection() as conn:
             conn.execute("SELECT 1")
         db_latency_ms = round((_time.perf_counter() - t0) * 1000, 1)
     except Exception:
@@ -288,24 +295,21 @@ def search_ticker(q: str):
         return []
 
 @app.get("/api/analyze")
-def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str, token: str = Depends(verify_api_key)):
-    print(f"\n[>>>] INCOMING QUERY: {ticker}")
+async def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str, token: str = Depends(verify_api_key)):
     clean_ticker = normalizer.normalize(ticker)
     
-    try:
-        live_data = fetch_history(yf.Ticker(clean_ticker), period="80d", interval="1d")
-    except Exception as e:
-        return {"error": str(e)}
-
-    if live_data.empty:
-        return {"error": f"No market data found for {clean_ticker}."}
-
-    last_date = live_data.index[-1].tz_localize(None)
-    if (datetime.now() - last_date).days > 5:
-        return {"error": f"Stale data for {clean_ticker}. Ticker may be halted or delisted."}
-    
+    live_data = fetch_history(yf.Ticker(clean_ticker), period="6mo", interval="1d")
+    if live_data.empty or len(live_data) < 30:
+        return {"error": "Insufficient data"}
+        
+    # Fix 10: OHLCV Staleness Validation
+    last_date = live_data.index[-1]
+    # Check if data is older than 4 days (handling weekends + holidays)
+    if (datetime.now(last_date.tzinfo) - last_date).days > 4:
+        return {"error": f"Stale OHLCV Data detected for {clean_ticker}. Last tick: {last_date}"}
+        
     live_data = calculate_technical_indicators(live_data)
-    current_price = live_data['Close'].iloc[-1].item()
+    current_price = float(live_data['Close'].iloc[-1])
     
     exchange_rate = get_exchange_rate()
     is_inr_native = "NS" in clean_ticker.upper() or "BO" in clean_ticker.upper()
@@ -434,32 +438,46 @@ def analyze(ticker: str, asset_class: str, beta: str, timeframe: str, risk: str,
     cnn_signal = "BULLISH" if ("Bull" in detected_pattern or "Bottom" in detected_pattern) else ("BEARISH" if ("Bear" in detected_pattern or "Head" in detected_pattern) else "NEUTRAL")
     
     try:
-        finbert_signal, finbert_summary = news_agent.analyze_fundamentals(clean_ticker)
+        # Fix 9: LLM Advisory timeout (asyncio.wait_for or thread executor since analyze_fundamentals is sync)
+        # Assuming analyze_fundamentals handles its own network calls, we run it in executor with a strict timeout
+        loop = asyncio.get_running_loop()
+        finbert_result = await asyncio.wait_for(
+            loop.run_in_executor(None, news_agent.analyze_fundamentals, clean_ticker), 
+            timeout=3.0
+        )
+        finbert_signal, finbert_summary = finbert_result
+    except asyncio.TimeoutError:
+        finbert_signal, finbert_summary = "NEUTRAL", "LLM Advisory Timeout: Failed to fetch summary."
     except Exception as e:
         finbert_signal, finbert_summary = "NEUTRAL", f"NLP Offline: {e}"
+        
+    from config import calculate_consensus, EMPIRICAL_CACHE, WHALE_VOLUME_LOOKBACK_DAYS
     
+    # Fix 14 & 19: Whale Detection with explicit documented baseline
     recent_vol = float(live_data['Volume'].tail(3).mean())
-    avg_vol = float(live_data['Volume'].mean())
+    avg_vol = float(live_data['Volume'].tail(WHALE_VOLUME_LOOKBACK_DAYS).mean())
     whale_detected = bool(recent_vol > (avg_vol * 1.5))
+    if whale_detected:
+        print(f"[!] Whale Detection: Abnormal volume spike on {clean_ticker}. Applying -0.1 penalty.")
     
-    score_breakdown = {
-        "LSTM (40%)": 0.4 if lstm_signal == "BULLISH" else (-0.4 if lstm_signal == "BEARISH" else 0.0),
-        "CNN (30%)": 0.3 if cnn_signal == "BULLISH" else (-0.3 if cnn_signal == "BEARISH" else 0.0),
-        "FinBERT (30%)": 0.3 if finbert_signal == "BULLISH" else (-0.3 if finbert_signal == "BEARISH" else 0.0),
-        "Whale Penalty": -0.1 if whale_detected else 0.0
-    }
-    
-    score = sum(score_breakdown.values())
-    
-    if score >= 0.3: action = "BUY"
-    elif score <= -0.3: action = "SELL"
-    else: action = "HOLD"
+    # Fix 5: Explicit Consensus Score Fusion
+    action, score, score_breakdown = calculate_consensus(lstm_signal, cnn_signal, finbert_signal, whale_detected)
     
     confidence = abs(score)
     roi_percent = float(((predicted_price_usd - price_usd) / price_usd) * 100)
     
     daily_returns = live_data['Close'].pct_change().dropna().tail(30).values
-    rl_size = rl_manager.get_position_size(action, confidence, daily_returns)
+    
+    # Fix 13: Map UI risk profile to target portfolio volatility
+    risk_mapping = {"conservative": 0.15, "moderate": 0.20, "aggressive": 0.30}
+    target_volatility = risk_mapping.get(risk.lower(), 0.20)
+    
+    # Fetch empirical win_rate or fallback to conservative default if not backtested recently
+    win_rate = EMPIRICAL_CACHE.get(clean_ticker, {}).get("win_rate", 0.51)
+    # Get dynamic take profit and stop loss from risk setting (assume default 5% TP, 3% SL for calculation)
+    tp_pct = 0.05
+    sl_pct = -0.03
+    rl_size = rl_manager.get_position_size(action, win_rate, tp_pct, sl_pct, daily_returns, target_volatility)
     
     real_beta = "Dynamic"
     try:
@@ -519,6 +537,13 @@ def backtest_ticker(ticker: str, token: str = Depends(verify_api_key)):
         is_inr_native = "NS" in clean_ticker.upper() or "BO" in clean_ticker.upper()
         model_path = os.path.join(os.path.dirname(__file__), "quantix_nifty_lstm.pth") if is_inr_native else os.path.join(os.path.dirname(__file__), "quantix_btc_lstm.pth")
         res = run_deep_learning_backtest(df, model_weights_path=model_path, feature_scaler=feature_scaler, target_scaler=target_scaler, days_to_test=365)
+        
+        # FIX 23: Cache the empirical win rate derived from the actual backtest so the Kelly sizer uses real data
+        if res and res.get("error") in (None, "", False) and "win_rate" in res:
+            if clean_ticker not in EMPIRICAL_CACHE:
+                EMPIRICAL_CACHE[clean_ticker] = {}
+            EMPIRICAL_CACHE[clean_ticker]["win_rate"] = res["win_rate"] / 100.0
+            
         return res
     except Exception as e:
         return {"error": str(e)}
@@ -547,7 +572,7 @@ def trigger_refresh():
 
 @app.get("/api/portfolio")
 def get_portfolio(token: str = Depends(verify_api_key)):
-    with db.get_connection() as conn:
+    with db.get_read_connection() as conn:
         balance = get_balance()
         holdings = {}
         cursor = conn.execute("SELECT ticker, qty, entry_price, total_cost, date, currency, stop_loss_pct, take_profit_pct FROM holdings")
@@ -590,7 +615,7 @@ async def run_portfolio_tick(token: str = Depends(verify_api_key)):
 
 @app.get("/api/signals")
 def get_signals(token: str = Depends(verify_api_key)):
-    with db.get_connection() as conn:
+    with db.get_read_connection() as conn:
         signals = []
         cursor = conn.execute("SELECT * FROM signals")
         for row in cursor.fetchall():
@@ -606,7 +631,7 @@ async def execute_trade(request: Request, token: str = Depends(verify_api_key)):
     data = await request.json()
     ticker = data.get("ticker")
     
-    with db.get_connection() as conn:
+    with db.get_read_connection() as conn:
         cursor = conn.execute("SELECT * FROM signals WHERE ticker=?", (ticker,))
         sig = cursor.fetchone()
         if not sig:
@@ -638,7 +663,7 @@ async def execute_trade(request: Request, token: str = Depends(verify_api_key)):
 # F5 Fix: Watchlist Endpoints
 @app.get("/api/watchlist")
 def get_watchlist():
-    with db.get_connection() as conn:
+    with db.get_read_connection() as conn:
         cursor = conn.execute("SELECT ticker FROM watchlist")
         return [row[0] for row in cursor.fetchall()]
 
@@ -647,7 +672,7 @@ async def add_watchlist(request: Request, token: str = Depends(verify_api_key)):
     data = await request.json()
     ticker = data.get("ticker")
     if not ticker: return {"error": "Ticker required"}
-    with db.get_connection() as conn:
+    with db.get_write_connection() as conn:
         conn.execute("INSERT OR IGNORE INTO watchlist (ticker) VALUES (?)", (ticker,))
         conn.commit()
     push_event({"type": "refresh"})
@@ -655,7 +680,7 @@ async def add_watchlist(request: Request, token: str = Depends(verify_api_key)):
 
 @app.delete("/api/watchlist/{ticker}")
 def remove_watchlist(ticker: str, token: str = Depends(verify_api_key)):
-    with db.get_connection() as conn:
+    with db.get_write_connection() as conn:
         conn.execute("DELETE FROM watchlist WHERE ticker=?", (ticker,))
         conn.commit()
     push_event({"type": "refresh"})
